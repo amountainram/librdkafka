@@ -3,7 +3,13 @@ cmake_minimum_required(VERSION 3.5)
 include("packaging/cmake/parseversion.cmake")
 parseversion("src/rdkafka.h")
 
-project(RdKafka VERSION ${RDKAFKA_VERSION})
+project(RdKafka VERSION ${RDKAFKA_VERSION} LANGUAGES C)
+
+# The C++ library is optional, and so is a C++ compiler
+option(RDKAFKA_BUILD_CPP "Build the C++ library" ON)
+if(RDKAFKA_BUILD_CPP)
+  enable_language(CXX)
+endif()
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/packaging/cmake/Modules/")
 
@@ -21,7 +27,9 @@ set(BUILT_WITH "CMAKE")
 
 # Toolchain {
 list(APPEND BUILT_WITH "${CMAKE_C_COMPILER_ID}")
-list(APPEND BUILT_WITH "${CMAKE_CXX_COMPILER_ID}")
+if(RDKAFKA_BUILD_CPP)
+  list(APPEND BUILT_WITH "${CMAKE_CXX_COMPILER_ID}")
+endif()
 # }
 
 # PkgConfig {
@@ -279,7 +287,9 @@ install(
 )
 
 add_subdirectory(src)
-add_subdirectory(src-cpp)
+if(RDKAFKA_BUILD_CPP)
+  add_subdirectory(src-cpp)
+endif()
 
 if(RDKAFKA_BUILD_EXAMPLES)
   add_subdirectory(examples)
