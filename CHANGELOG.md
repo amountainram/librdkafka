@@ -2,6 +2,12 @@
 
 ## Fixes
 
+### General fixes
+
+* OAUTHBEARER OIDC: NUL-terminate the decoded JWT payload. Without base64
+  padding, i.e. a payload length multiple of 4, its JSON parsing read past
+  the end of the heap buffer.
+
 ### Admin fixes
 
 * Fix a crash in `ListConsumerGroupOffsets` when a coordinator error is returned

@@ -186,6 +186,10 @@ static const char *rd_kafka_jwt_b64_decode_payload(const char *src,
                             (int)payload_len) == -1) {
                 errstr = "Failed to decode base64 payload";
         }
+        /* EVP_DecodeBlock() doesn't terminate the string: without padding,
+         * e.g. a payload length multiple of 4, nothing follows the last
+         * decoded byte, and the caller's cJSON_Parse() would read past it. */
+        (*bufplainp)[nbytesdecoded] = '\0';
 
 done:
         RD_IF_FREE(payload, rd_free);

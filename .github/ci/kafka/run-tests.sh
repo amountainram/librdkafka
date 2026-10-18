@@ -23,6 +23,12 @@ export KAFKA_VERSION="${KAFKA_VERSION:-4.3.0}"
 image="docker.io/apache/kafka:${KAFKA_VERSION}"
 work="${KAFKA_TESTS_DIR:-${TMPDIR:-/tmp}/librdkafka-kafka-tests}"
 brokers="localhost:9092,localhost:9093,localhost:9094"
+
+# Empty means all, as the workflow passes it: run-test-batches.py takes a
+# set TESTS as the list to run, and an empty one fails.
+if [[ -z "${TESTS:-}" ]]; then
+    unset TESTS
+fi
 compose=(docker compose --file "$here/docker-compose.yml")
 
 cleanup() {
