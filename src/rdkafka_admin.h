@@ -103,6 +103,7 @@ struct rd_kafka_AdminOptions_s {
                                             *     DescribeConsumerGroups
                                             *     DescribeCluster
                                             *     DescribeTopics
+                                            *     DescribeTopicPartitions
                                             */
 
         rd_kafka_confval_t
@@ -123,6 +124,13 @@ struct rd_kafka_AdminOptions_s {
                               *   Default Set to
                               * RD_KAFKA_ISOLATION_LEVEL_READ_UNCOMMITTED
                               */
+
+        rd_kafka_confval_t
+            partition_size_limit_per_response; /**< INT: partitions per
+                                                *   response.
+                                                *   Valid for:
+                                                *     DescribeTopicPartitions
+                                                */
 
         rd_kafka_confval_t opaque; /**< PTR: Application opaque.
                                     *   Valid for all. */
@@ -587,6 +595,16 @@ struct rd_kafka_TopicPartitionInfo_s {
         rd_kafka_Node_t **isr;      /**< List of in sync replica nodes. */
         size_t replica_cnt;         /**< Count of partition replicas. */
         rd_kafka_Node_t **replicas; /**< List of replica nodes. */
+        int32_t leader_epoch;       /**< Leader epoch, -1 if unknown. */
+        /* KIP-966, DescribeTopicPartitions only: */
+        size_t elr_cnt;            /**< Count of eligible leader replicas. */
+        rd_kafka_Node_t **elr;     /**< Eligible leader replica nodes. */
+        size_t last_known_elr_cnt; /**< Count of last known eligible leader
+                                    *   replicas. */
+        rd_kafka_Node_t **last_known_elr;   /**< Last known eligible leader
+                                             *   replica nodes. */
+        size_t offline_replica_cnt;         /**< Count of offline replicas. */
+        rd_kafka_Node_t **offline_replicas; /**< Offline replica nodes. */
 };
 
 /**

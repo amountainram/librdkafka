@@ -120,6 +120,7 @@
 #define RD_KAFKAP_GetTelemetrySubscriptions    71
 #define RD_KAFKAP_PushTelemetry                72
 #define RD_KAFKAP_AssignReplicasToDirs         73
+#define RD_KAFKAP_DescribeTopicPartitions      75
 #define RD_KAFKAP_ShareGroupHeartbeat          76
 #define RD_KAFKAP_ShareGroupDescribe           77
 #define RD_KAFKAP_ShareFetch                   78

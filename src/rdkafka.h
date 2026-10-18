@@ -6719,6 +6719,8 @@ typedef int rd_kafka_event_type_t;
 #define RD_KAFKA_EVENT_LISTOFFSETS_RESULT 0x400000
 /** ElectLeaders_result_t */
 #define RD_KAFKA_EVENT_ELECTLEADERS_RESULT 0x800000
+/** DescribeTopicPartitions_result_t */
+#define RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT 0x1000000
 
 /**
  * @returns the event type for the given event.
@@ -6878,6 +6880,7 @@ int rd_kafka_event_error_is_fatal(rd_kafka_event_t *rkev);
  *  - RD_KAFKA_EVENT_DESCRIBECLUSTER_RESULT
  *  - RD_KAFKA_EVENT_LISTOFFSETS_RESULT
  *  - RD_KAFKA_EVENT_ELECTLEADERS_RESULT
+ *  - RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT
  */
 RD_EXPORT
 void *rd_kafka_event_opaque(rd_kafka_event_t *rkev);
@@ -7003,6 +7006,8 @@ typedef rd_kafka_event_t rd_kafka_AlterUserScramCredentials_result_t;
 typedef rd_kafka_event_t rd_kafka_ListOffsets_result_t;
 /*! ElectLeaders result type */
 typedef rd_kafka_event_t rd_kafka_ElectLeaders_result_t;
+/*! DescribeTopicPartitions result type */
+typedef rd_kafka_event_t rd_kafka_DescribeTopicPartitions_result_t;
 
 /**
  * @brief Get CreateTopics result.
@@ -7289,6 +7294,21 @@ rd_kafka_event_AlterUserScramCredentials_result(rd_kafka_event_t *rkev);
  */
 RD_EXPORT const rd_kafka_ElectLeaders_result_t *
 rd_kafka_event_ElectLeaders_result(rd_kafka_event_t *rkev);
+
+/**
+ * @brief Get DescribeTopicPartitions result.
+ *
+ * @returns the result of a DescribeTopicPartitions request, or NULL if
+ *          event is of different type.
+ *
+ * @remark The lifetime of the returned memory is the same
+ *         as the lifetime of the \p rkev object.
+ *
+ * Event types:
+ *  RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT
+ */
+RD_EXPORT const rd_kafka_DescribeTopicPartitions_result_t *
+rd_kafka_event_DescribeTopicPartitions_result(rd_kafka_event_t *rkev);
 
 /**
  * @brief Poll a queue for an event for max \p timeout_ms.
@@ -8227,7 +8247,9 @@ typedef enum rd_kafka_admin_op_t {
         RD_KAFKA_ADMIN_OP_DESCRIBECLUSTER, /**< DescribeCluster */
         RD_KAFKA_ADMIN_OP_LISTOFFSETS,     /**< ListOffsets */
         RD_KAFKA_ADMIN_OP_ELECTLEADERS,    /**< ElectLeaders */
-        RD_KAFKA_ADMIN_OP__CNT             /**< Number of ops defined */
+        /** DescribeTopicPartitions */
+        RD_KAFKA_ADMIN_OP_DESCRIBETOPICPARTITIONS,
+        RD_KAFKA_ADMIN_OP__CNT /**< Number of ops defined */
 } rd_kafka_admin_op_t;
 
 /**
@@ -8420,8 +8442,8 @@ rd_kafka_error_t *rd_kafka_AdminOptions_set_require_stable_offsets(
 
 /**
  * @brief Whether broker should return authorized operations for the given
- *        resource in the DescribeConsumerGroups, DescribeTopics, or
- *        DescribeCluster calls.
+ *        resource in the DescribeConsumerGroups, DescribeTopics,
+ *        DescribeTopicPartitions, or DescribeCluster calls.
  *
  * @param options Admin options.
  * @param true_or_false Defaults to false.
@@ -8430,12 +8452,31 @@ rd_kafka_error_t *rd_kafka_AdminOptions_set_require_stable_offsets(
  *         released with rd_kafka_error_destroy() in case of error.
  *
  * @remark This option is valid for DescribeConsumerGroups, DescribeTopics,
- *         DescribeCluster.
+ *         DescribeTopicPartitions, DescribeCluster.
  */
 RD_EXPORT
 rd_kafka_error_t *rd_kafka_AdminOptions_set_include_authorized_operations(
     rd_kafka_AdminOptions_t *options,
     int true_or_false);
+
+/**
+ * @brief The maximum number of partitions the broker returns per
+ *        DescribeTopicPartitions response: more take further requests, made
+ *        by librdkafka (the DescribeTopicPartitions ResponsePartitionLimit).
+ *
+ * @param options Admin options.
+ * @param limit Partitions per response, from 1. Defaults to 2000; the broker
+ *              may cap it lower (max.request.partition.size.limit).
+ *
+ * @return NULL on success, a new error instance that must be
+ *         released with rd_kafka_error_destroy() in case of error.
+ *
+ * @remark This option is valid for DescribeTopicPartitions.
+ */
+RD_EXPORT
+rd_kafka_error_t *rd_kafka_AdminOptions_set_partition_size_limit_per_response(
+    rd_kafka_AdminOptions_t *options,
+    int limit);
 
 /**
  * @brief Set consumer groups states to query for.
@@ -9580,6 +9621,73 @@ const rd_kafka_Node_t **rd_kafka_TopicPartitionInfo_replicas(
     size_t *cntp);
 
 /**
+ * @brief Gets the leader epoch of \p partition.
+ *
+ * @param partition The partition info.
+ *
+ * @return The leader epoch, or -1 if unknown: always for DescribeTopics
+ *         results.
+ */
+RD_EXPORT
+int32_t rd_kafka_TopicPartitionInfo_leader_epoch(
+    const rd_kafka_TopicPartitionInfo_t *partition);
+
+/**
+ * @brief Gets the eligible leader replicas (ELR, KIP-966) of \p partition:
+ *        the replicas that can safely become leader, though out of the ISR.
+ *
+ * @param partition The partition info.
+ * @param cntp is updated with the count of eligible leader replicas.
+ *
+ * @return The eligible leader replica nodes. None for DescribeTopics
+ *         results, or when the cluster doesn't track them.
+ *
+ * @remark The lifetime of the returned memory is the same
+ *         as the lifetime of the \p partition object.
+ */
+RD_EXPORT
+const rd_kafka_Node_t **rd_kafka_TopicPartitionInfo_eligible_leader_replicas(
+    const rd_kafka_TopicPartitionInfo_t *partition,
+    size_t *cntp);
+
+/**
+ * @brief Gets the last known eligible leader replicas (KIP-966) of
+ *        \p partition: the eligible leader replicas when the partition
+ *        last had none in its ISR.
+ *
+ * @param partition The partition info.
+ * @param cntp is updated with the count of last known eligible leader
+ *             replicas.
+ *
+ * @return The last known eligible leader replica nodes. None for
+ *         DescribeTopics results, or when the cluster doesn't track them.
+ *
+ * @remark The lifetime of the returned memory is the same
+ *         as the lifetime of the \p partition object.
+ */
+RD_EXPORT
+const rd_kafka_Node_t **
+rd_kafka_TopicPartitionInfo_last_known_eligible_leader_replicas(
+    const rd_kafka_TopicPartitionInfo_t *partition,
+    size_t *cntp);
+
+/**
+ * @brief Gets the offline replicas of \p partition.
+ *
+ * @param partition The partition info.
+ * @param cntp is updated with the count of offline replicas.
+ *
+ * @return The offline replica nodes. None for DescribeTopics results.
+ *
+ * @remark The lifetime of the returned memory is the same
+ *         as the lifetime of the \p partition object.
+ */
+RD_EXPORT
+const rd_kafka_Node_t **rd_kafka_TopicPartitionInfo_offline_replicas(
+    const rd_kafka_TopicPartitionInfo_t *partition,
+    size_t *cntp);
+
+/**
  * @brief Gets the topic authorized ACL operations for the \p topicdesc topic.
  *
  * @param topicdesc The topic description.
@@ -9647,6 +9755,77 @@ RD_EXPORT
 const rd_kafka_error_t *
 rd_kafka_TopicDescription_error(const rd_kafka_TopicDescription_t *topicdesc);
 
+
+/**@}*/
+
+/**
+ * @name Admin API - DescribeTopicPartitions
+ * @{
+ */
+
+/**
+ * @brief Describe topics and their partitions with the
+ *        DescribeTopicPartitions API (KIP-966), the given ones or all of
+ *        them.
+ *
+ * Unlike rd_kafka_DescribeTopics(), which uses a Metadata request, the
+ * broker answers in pages of at most
+ * rd_kafka_AdminOptions_set_partition_size_limit_per_response() partitions:
+ * librdkafka requests the following pages itself, and returns every topic
+ * at once, as described across the pages. Partitions also carry their
+ * leader epoch, eligible leader replicas, and offline replicas.
+ *
+ * @param rk Client instance.
+ * @param topics Collection of topics to describe: none to describe every
+ *               topic in the cluster.
+ * @param options Optional admin options, or NULL for defaults.
+ *                Valid options:
+ *                 - include_authorized_operations
+ *                 - partition_size_limit_per_response
+ *                 - request_timeout: of the whole request, all its pages
+ *                 - broker
+ * @param rkqu Queue to emit result on.
+ *
+ * @remark The result event type emitted on the supplied queue is of type
+ *         \c RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT
+ *
+ * @remark Requires broker version >= 3.8.0 (DescribeTopicPartitions API):
+ *         an older broker fails the request with
+ *         RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE, rd_kafka_DescribeTopics()
+ *         describes topics there.
+ *
+ * @remark A topic is described across pages as they come, without a
+ *         consistent snapshot: the cluster may change between two pages.
+ *
+ * @remark Broker nodes are reported with the host and port the client knows
+ *         them by, without rack, which the API doesn't return.
+ */
+RD_EXPORT
+void rd_kafka_DescribeTopicPartitions(rd_kafka_t *rk,
+                                      const rd_kafka_TopicCollection_t *topics,
+                                      const rd_kafka_AdminOptions_t *options,
+                                      rd_kafka_queue_t *rkqu);
+
+/**
+ * @brief Get an array of topic results from a DescribeTopicPartitions
+ *        result.
+ *
+ * @param result Result to get topics results from.
+ * @param cntp is updated to the number of elements in the array.
+ *
+ * @returns The described topics: in the requested order when named, else
+ *          in the broker's order (by name). Topics the broker failed to
+ *          describe, e.g. unknown ones, have their
+ *          rd_kafka_TopicDescription_error() set.
+ *
+ * @remark The lifetime of the returned memory is the same
+ *         as the lifetime of the \p result object.
+ */
+RD_EXPORT
+const rd_kafka_TopicDescription_t **
+rd_kafka_DescribeTopicPartitions_result_topics(
+    const rd_kafka_DescribeTopicPartitions_result_t *result,
+    size_t *cntp);
 
 /**@}*/
 

@@ -46,6 +46,9 @@ For more complex uses, see:
  * [list_consumer_groups.c](list_consumer_groups.c) - List consumer groups.
  * [describe_consumer_groups.c](describe_consumer_groups.c) - Describe consumer groups.
  * [describe_topics.c](describe_topics.c) - Describe topics.
+ * [describe_topic_partitions.c](describe_topic_partitions.c) - Describe
+   topics, or all of them, and their partitions with DescribeTopicPartitions
+   (KIP-966).
  * [describe_cluster.c](describe_cluster.c) - Describe cluster.
  * [list_consumer_group_offsets.c](list_consumer_group_offsets.c) - List offsets of a consumer group.
  * [alter_consumer_group_offsets.c](alter_consumer_group_offsets.c) - Alter offsets of a consumer group.

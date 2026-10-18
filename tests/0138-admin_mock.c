@@ -381,6 +381,241 @@ static void do_test_ListConsumerGroupOffsets_errors(rd_kafka_type_t type,
         SUB_TEST_PASS();
 }
 
+/**
+ * @brief Calls DescribeTopicPartitions for \p topics (none for all), with
+ *        \p limit partitions per response, and returns the result event:
+ *        asserting its error is \p exp_err.
+ */
+static rd_kafka_event_t *
+describe_topic_partitions(rd_kafka_t *rk,
+                          rd_kafka_queue_t *q,
+                          const char **topics,
+                          size_t topic_cnt,
+                          int limit,
+                          int timeout_ms,
+                          rd_kafka_resp_err_t exp_err) {
+        rd_kafka_TopicCollection_t *collection =
+            rd_kafka_TopicCollection_of_topic_names(topics, topic_cnt);
+        rd_kafka_AdminOptions_t *options = rd_kafka_AdminOptions_new(
+            rk, RD_KAFKA_ADMIN_OP_DESCRIBETOPICPARTITIONS);
+        rd_kafka_event_t *event;
+        char errstr[512];
+
+        TEST_CALL_ERR__(rd_kafka_AdminOptions_set_request_timeout(
+            options, timeout_ms, errstr, sizeof(errstr)));
+        TEST_CALL_ERROR__(
+            rd_kafka_AdminOptions_set_partition_size_limit_per_response(options,
+                                                                        limit));
+
+        rd_kafka_DescribeTopicPartitions(rk, collection, options, q);
+        event = test_wait_admin_result(
+            q, RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT,
+            timeout_ms + tmout_multip(5000));
+        TEST_ASSERT(rd_kafka_event_DescribeTopicPartitions_result(event),
+                    "Expected DescribeTopicPartitions result, got %s",
+                    rd_kafka_event_name(event));
+        TEST_ASSERT(rd_kafka_event_error(event) == exp_err,
+                    "Expected %s, got %s: %s", rd_kafka_err2name(exp_err),
+                    rd_kafka_err2name(rd_kafka_event_error(event)),
+                    rd_kafka_event_error_string(event));
+
+        rd_kafka_AdminOptions_destroy(options);
+        rd_kafka_TopicCollection_destroy(collection);
+        return event;
+}
+
+/**
+ * @brief Asserts the topics of \p event are \p exp_topics, with
+ *        \p exp_partitions partitions each (-1 for an error \p exp_err):
+ *        the partitions in order, led by known brokers.
+ */
+static void assert_topic_partitions(rd_kafka_event_t *event,
+                                    const char **exp_topics,
+                                    const int *exp_partitions,
+                                    size_t exp_cnt,
+                                    rd_kafka_resp_err_t exp_err) {
+        const rd_kafka_DescribeTopicPartitions_result_t *result =
+            rd_kafka_event_DescribeTopicPartitions_result(event);
+        const rd_kafka_TopicDescription_t **topics;
+        size_t cnt, i;
+
+        topics = rd_kafka_DescribeTopicPartitions_result_topics(result, &cnt);
+        TEST_ASSERT(cnt == exp_cnt, "Expected %" PRIusz " topics, got %" PRIusz,
+                    exp_cnt, cnt);
+
+        for (i = 0; i < cnt; i++) {
+                const rd_kafka_error_t *error =
+                    rd_kafka_TopicDescription_error(topics[i]);
+                const rd_kafka_TopicPartitionInfo_t **partitions;
+                size_t partition_cnt, j;
+
+                TEST_ASSERT(!strcmp(rd_kafka_TopicDescription_name(topics[i]),
+                                    exp_topics[i]),
+                            "Expected topic %s at %" PRIusz ", got %s",
+                            exp_topics[i], i,
+                            rd_kafka_TopicDescription_name(topics[i]));
+
+                if (exp_partitions[i] == -1) {
+                        TEST_ASSERT(
+                            error && rd_kafka_error_code(error) == exp_err,
+                            "Expected %s for %s, got %s",
+                            rd_kafka_err2name(exp_err), exp_topics[i],
+                            error ? rd_kafka_error_name(error) : "none");
+                        continue;
+                }
+
+                TEST_ASSERT(!error, "Unexpected error for %s: %s",
+                            exp_topics[i], rd_kafka_error_string(error));
+                partitions = rd_kafka_TopicDescription_partitions(
+                    topics[i], &partition_cnt);
+                TEST_ASSERT((int)partition_cnt == exp_partitions[i],
+                            "Expected %d partitions for %s, got %" PRIusz,
+                            exp_partitions[i], exp_topics[i], partition_cnt);
+
+                for (j = 0; j < partition_cnt; j++) {
+                        const rd_kafka_Node_t *leader =
+                            rd_kafka_TopicPartitionInfo_leader(partitions[j]);
+                        size_t replica_cnt;
+
+                        TEST_ASSERT(rd_kafka_TopicPartitionInfo_partition(
+                                        partitions[j]) == (int)j,
+                                    "Expected partition %" PRIusz
+                                    " of %s at %" PRIusz,
+                                    j, exp_topics[i], j);
+                        TEST_ASSERT(leader && rd_kafka_Node_host(leader),
+                                    "Expected a known leader for %s [%" PRIusz
+                                    "]",
+                                    exp_topics[i], j);
+                        rd_kafka_TopicPartitionInfo_replicas(partitions[j],
+                                                             &replica_cnt);
+                        TEST_ASSERT(replica_cnt == 2,
+                                    "Expected 2 replicas, got %" PRIusz,
+                                    replica_cnt);
+                }
+        }
+}
+
+/**
+ * @brief DescribeTopicPartitions: all or named topics, in pages, topic
+ *        errors, then success; a page failing fails the whole request.
+ */
+static void do_test_DescribeTopicPartitions(void) {
+        rd_kafka_conf_t *conf;
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        const char *bootstraps;
+        rd_kafka_queue_t *q;
+        rd_kafka_event_t *event;
+        const char *all[]        = {"dtp-a", "dtp-b", "dtp-c"};
+        const int all_parts[]    = {3, 1, 4};
+        const char *named[]      = {"dtp-c", "dtp-nope", "dtp-a"};
+        const int named_parts[]  = {4, -1, 3};
+        const char *only_a[]     = {"dtp-a"};
+        const int only_a_parts[] = {3};
+        const int error_parts[]  = {-1};
+
+        SUB_TEST_QUICK();
+
+        test_conf_init(&conf, NULL, 60);
+        mcluster = test_mock_cluster_new(3, &bootstraps);
+        TEST_CALL_ERR__(rd_kafka_mock_topic_create(mcluster, "dtp-c", 4, 2));
+        TEST_CALL_ERR__(rd_kafka_mock_topic_create(mcluster, "dtp-a", 3, 2));
+        TEST_CALL_ERR__(rd_kafka_mock_topic_create(mcluster, "dtp-b", 1, 2));
+        /* Admin requests go to the controller */
+        rd_kafka_mock_set_controller_id(mcluster, 1);
+        test_conf_set(conf, "bootstrap.servers", bootstraps);
+        rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
+        q  = rd_kafka_queue_new(rk);
+
+        TEST_SAY("All topics, in a response\n");
+        event = describe_topic_partitions(rk, q, NULL, 0, 2000,
+                                          tmout_multip(5000), 0);
+        assert_topic_partitions(event, all, all_parts, 3, 0);
+        rd_kafka_event_destroy(event);
+
+        TEST_SAY("All topics, a partition per response\n");
+        event =
+            describe_topic_partitions(rk, q, NULL, 0, 1, tmout_multip(5000), 0);
+        assert_topic_partitions(event, all, all_parts, 3, 0);
+        rd_kafka_event_destroy(event);
+
+        TEST_SAY("Named topics, an unknown one, in the requested order\n");
+        event = describe_topic_partitions(rk, q, named, 3, 2,
+                                          tmout_multip(5000), 0);
+        assert_topic_partitions(event, named, named_parts, 3,
+                                RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART);
+        rd_kafka_event_destroy(event);
+
+        TEST_SAY("A topic error, then success\n");
+        rd_kafka_mock_push_request_errors(
+            mcluster, RD_KAFKAP_DescribeTopicPartitions, 1,
+            RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED);
+        event = describe_topic_partitions(rk, q, only_a, 1, 2000,
+                                          tmout_multip(5000), 0);
+        assert_topic_partitions(event, only_a, error_parts, 1,
+                                RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED);
+        rd_kafka_event_destroy(event);
+        event = describe_topic_partitions(rk, q, only_a, 1, 2000,
+                                          tmout_multip(5000), 0);
+        assert_topic_partitions(event, only_a, only_a_parts, 1, 0);
+        rd_kafka_event_destroy(event);
+
+        TEST_SAY("The second page timing out fails the whole request\n");
+        /* The controller answers the first page, not the second in time */
+        TEST_CALL_ERR__(rd_kafka_mock_broker_push_request_error_rtts(
+            mcluster, 1, RD_KAFKAP_DescribeTopicPartitions, 2,
+            RD_KAFKA_RESP_ERR_NO_ERROR, 0, RD_KAFKA_RESP_ERR_NO_ERROR,
+            tmout_multip(3000)));
+        event = describe_topic_partitions(rk, q, NULL, 0, 1, tmout_multip(1000),
+                                          RD_KAFKA_RESP_ERR__TIMED_OUT);
+        {
+                size_t cnt;
+                rd_kafka_DescribeTopicPartitions_result_topics(
+                    rd_kafka_event_DescribeTopicPartitions_result(event), &cnt);
+                TEST_ASSERT(cnt == 0, "Expected no topics, got %" PRIusz, cnt);
+        }
+        rd_kafka_event_destroy(event);
+
+        rd_kafka_queue_destroy(q);
+        rd_kafka_destroy(rk);
+        test_mock_cluster_destroy(mcluster);
+        SUB_TEST_PASS();
+}
+
+/**
+ * @brief DescribeTopicPartitions on brokers without it fails with
+ *        __UNSUPPORTED_FEATURE.
+ */
+static void do_test_DescribeTopicPartitions_unsupported(void) {
+        rd_kafka_conf_t *conf;
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        const char *bootstraps;
+        rd_kafka_queue_t *q;
+        rd_kafka_event_t *event;
+
+        SUB_TEST_QUICK();
+
+        test_conf_init(&conf, NULL, 30);
+        mcluster = test_mock_cluster_new(1, &bootstraps);
+        TEST_CALL_ERR__(rd_kafka_mock_set_apiversion(
+            mcluster, RD_KAFKAP_DescribeTopicPartitions, -1, -1));
+        rd_kafka_mock_set_controller_id(mcluster, 1);
+        test_conf_set(conf, "bootstrap.servers", bootstraps);
+        rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
+        q  = rd_kafka_queue_new(rk);
+
+        event =
+            describe_topic_partitions(rk, q, NULL, 0, 2000, tmout_multip(5000),
+                                      RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE);
+        rd_kafka_event_destroy(event);
+
+        rd_kafka_queue_destroy(q);
+        rd_kafka_destroy(rk);
+        test_mock_cluster_destroy(mcluster);
+        SUB_TEST_PASS();
+}
+
 int main_0138_admin_mock(int argc, char **argv) {
 
         TEST_SKIP_MOCK_CLUSTER(0);
@@ -393,6 +628,9 @@ int main_0138_admin_mock(int argc, char **argv) {
         do_test_ListConsumerGroupOffsets_errors(RD_KAFKA_PRODUCER, rd_false);
         do_test_ListConsumerGroupOffsets_errors(RD_KAFKA_CONSUMER, rd_false);
         do_test_ListConsumerGroupOffsets_errors(RD_KAFKA_CONSUMER, rd_true);
+
+        do_test_DescribeTopicPartitions();
+        do_test_DescribeTopicPartitions_unsupported();
 
         return 0;
 }

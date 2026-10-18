@@ -56,6 +56,9 @@ target_link_libraries(user_scram PUBLIC rdkafka)
 add_executable(describe_topics describe_topics.c ${win32_sources})
 target_link_libraries(describe_topics PUBLIC rdkafka)
 
+add_executable(describe_topic_partitions describe_topic_partitions.c ${win32_sources})
+target_link_libraries(describe_topic_partitions PUBLIC rdkafka)
+
 add_executable(describe_cluster describe_cluster.c ${win32_sources})
 target_link_libraries(describe_cluster PUBLIC rdkafka)
 

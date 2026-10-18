@@ -9,6 +9,7 @@ EXAMPLES ?= rdkafka_example rdkafka_performance rdkafka_example_cpp \
 	list_consumer_groups \
 	describe_consumer_groups \
 	describe_topics \
+	describe_topic_partitions \
 	describe_cluster \
 	list_consumer_group_offsets \
 	alter_consumer_group_offsets \
@@ -101,6 +102,10 @@ describe_consumer_groups: ../src/librdkafka.a describe_consumer_groups.c
 		../src/librdkafka.a $(LIBS)
 
 describe_topics: ../src/librdkafka.a describe_topics.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $@.c -o $@ $(LDFLAGS) \
+		../src/librdkafka.a $(LIBS)
+
+describe_topic_partitions: ../src/librdkafka.a describe_topic_partitions.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $@.c -o $@ $(LDFLAGS) \
 		../src/librdkafka.a $(LIBS)
 

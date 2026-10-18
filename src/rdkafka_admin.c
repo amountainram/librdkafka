@@ -1441,12 +1441,22 @@ static rd_kafka_op_res_t rd_kafka_admin_fanout_worker(rd_kafka_t *rk,
                 return RD_KAFKA_OP_RES_HANDLED;
 
         rko_result = rd_kafka_admin_result_new(rko_fanout);
-        rd_list_init_copy(&rko_result->rko_u.admin_result.results,
-                          &rko_fanout->rko_u.admin_request.fanout.results);
-        rd_list_copy_to(&rko_result->rko_u.admin_result.results,
-                        &rko_fanout->rko_u.admin_request.fanout.results,
-                        rko_fanout->rko_u.admin_request.fanout.cbs->copy_result,
-                        NULL);
+        if (rko_fanout->rko_error) {
+                /* partial_response() failed the whole request: its error,
+                 * and no results. */
+                rd_kafka_admin_result_set_err(
+                    rko_result, rd_kafka_error_code(rko_fanout->rko_error),
+                    "%s", rd_kafka_error_string(rko_fanout->rko_error));
+        } else {
+                rd_list_init_copy(
+                    &rko_result->rko_u.admin_result.results,
+                    &rko_fanout->rko_u.admin_request.fanout.results);
+                rd_list_copy_to(
+                    &rko_result->rko_u.admin_result.results,
+                    &rko_fanout->rko_u.admin_request.fanout.results,
+                    rko_fanout->rko_u.admin_request.fanout.cbs->copy_result,
+                    NULL);
+        }
 
         /* Enqueue result on application queue, we're done. */
         rd_kafka_admin_result_enq(rko_fanout, rko_result);
@@ -1614,6 +1624,16 @@ rd_kafka_error_t *rd_kafka_AdminOptions_set_include_authorized_operations(
         return !err ? NULL : rd_kafka_error_new(err, "%s", errstr);
 }
 
+rd_kafka_error_t *rd_kafka_AdminOptions_set_partition_size_limit_per_response(
+    rd_kafka_AdminOptions_t *options,
+    int limit) {
+        char errstr[512];
+        rd_kafka_resp_err_t err = rd_kafka_confval_set_type(
+            &options->partition_size_limit_per_response, RD_KAFKA_CONFVAL_INT,
+            &limit, errstr, sizeof(errstr));
+        return !err ? NULL : rd_kafka_error_new(err, "%s", errstr);
+}
+
 rd_kafka_error_t *rd_kafka_AdminOptions_set_match_consumer_group_states(
     rd_kafka_AdminOptions_t *options,
     const rd_kafka_consumer_group_state_t *consumer_group_states,
@@ -1767,7 +1787,8 @@ static void rd_kafka_AdminOptions_init(rd_kafka_t *rk,
         if (options->for_api == RD_KAFKA_ADMIN_OP_ANY ||
             options->for_api == RD_KAFKA_ADMIN_OP_DESCRIBECONSUMERGROUPS ||
             options->for_api == RD_KAFKA_ADMIN_OP_DESCRIBECLUSTER ||
-            options->for_api == RD_KAFKA_ADMIN_OP_DESCRIBETOPICS)
+            options->for_api == RD_KAFKA_ADMIN_OP_DESCRIBETOPICS ||
+            options->for_api == RD_KAFKA_ADMIN_OP_DESCRIBETOPICPARTITIONS)
                 rd_kafka_confval_init_int(
                     &options->include_authorized_operations,
                     "include_authorized_operations", 0, 1, 0);
@@ -1799,6 +1820,16 @@ static void rd_kafka_AdminOptions_init(rd_kafka_t *rk,
         else
                 rd_kafka_confval_disable(&options->isolation_level,
                                          "isolation_level");
+
+        if (options->for_api == RD_KAFKA_ADMIN_OP_ANY ||
+            options->for_api == RD_KAFKA_ADMIN_OP_DESCRIBETOPICPARTITIONS)
+                rd_kafka_confval_init_int(
+                    &options->partition_size_limit_per_response,
+                    "partition_size_limit_per_response", 1, INT32_MAX, 2000);
+        else
+                rd_kafka_confval_disable(
+                    &options->partition_size_limit_per_response,
+                    "partition_size_limit_per_response");
 
         rd_kafka_confval_init_int(&options->broker, "broker", 0, INT32_MAX, -1);
         rd_kafka_confval_init_ptr(&options->opaque, "opaque");
@@ -8955,9 +8986,10 @@ static rd_kafka_TopicPartitionInfo_t *rd_kafka_TopicPartitionInfo_new(
         rd_kafka_TopicPartitionInfo_t *pinfo =
             rd_calloc(1, sizeof(rd_kafka_TopicPartitionInfo_t));
 
-        pinfo->partition   = partition->id;
-        pinfo->isr_cnt     = partition->isr_cnt;
-        pinfo->replica_cnt = partition->replica_cnt;
+        pinfo->partition    = partition->id;
+        pinfo->isr_cnt      = partition->isr_cnt;
+        pinfo->replica_cnt  = partition->replica_cnt;
+        pinfo->leader_epoch = -1;
 
         if (partition->leader >= 0) {
                 pinfo->leader = rd_kafka_Node_new_from_brokers(
@@ -9001,6 +9033,18 @@ rd_kafka_TopicPartitionInfo_destroy(rd_kafka_TopicPartitionInfo_t *pinfo) {
         for (i = 0; i < pinfo->replica_cnt; i++)
                 rd_kafka_Node_destroy(pinfo->replicas[i]);
         RD_IF_FREE(pinfo->replicas, rd_free);
+
+        for (i = 0; i < pinfo->elr_cnt; i++)
+                rd_kafka_Node_destroy(pinfo->elr[i]);
+        RD_IF_FREE(pinfo->elr, rd_free);
+
+        for (i = 0; i < pinfo->last_known_elr_cnt; i++)
+                rd_kafka_Node_destroy(pinfo->last_known_elr[i]);
+        RD_IF_FREE(pinfo->last_known_elr, rd_free);
+
+        for (i = 0; i < pinfo->offline_replica_cnt; i++)
+                rd_kafka_Node_destroy(pinfo->offline_replicas[i]);
+        RD_IF_FREE(pinfo->offline_replicas, rd_free);
 
         rd_free(pinfo);
 }
@@ -9112,6 +9156,33 @@ const rd_kafka_Node_t **rd_kafka_TopicPartitionInfo_replicas(
     size_t *cntp) {
         *cntp = partition->replica_cnt;
         return (const rd_kafka_Node_t **)partition->replicas;
+}
+
+int32_t rd_kafka_TopicPartitionInfo_leader_epoch(
+    const rd_kafka_TopicPartitionInfo_t *partition) {
+        return partition->leader_epoch;
+}
+
+const rd_kafka_Node_t **rd_kafka_TopicPartitionInfo_eligible_leader_replicas(
+    const rd_kafka_TopicPartitionInfo_t *partition,
+    size_t *cntp) {
+        *cntp = partition->elr_cnt;
+        return (const rd_kafka_Node_t **)partition->elr;
+}
+
+const rd_kafka_Node_t **
+rd_kafka_TopicPartitionInfo_last_known_eligible_leader_replicas(
+    const rd_kafka_TopicPartitionInfo_t *partition,
+    size_t *cntp) {
+        *cntp = partition->last_known_elr_cnt;
+        return (const rd_kafka_Node_t **)partition->last_known_elr;
+}
+
+const rd_kafka_Node_t **rd_kafka_TopicPartitionInfo_offline_replicas(
+    const rd_kafka_TopicPartitionInfo_t *partition,
+    size_t *cntp) {
+        *cntp = partition->offline_replica_cnt;
+        return (const rd_kafka_Node_t **)partition->offline_replicas;
 }
 
 const rd_kafka_TopicPartitionInfo_t **rd_kafka_TopicDescription_partitions(
@@ -9372,6 +9443,780 @@ void rd_kafka_DescribeTopics(rd_kafka_t *rk,
                 rd_kafka_admin_common_worker_destroy(rk, rko,
                                                      rd_true /*destroy*/);
         }
+}
+
+/**@}*/
+
+/**
+ * @name Describe Topic Partitions
+ * @{
+ *
+ * DescribeTopicPartitions (KIP-966) describes the given topics, or all of
+ * them, in pages of at most ResponsePartitionLimit partitions: a page ends
+ * with the cursor (topic, partition) of the next one, if any.
+ *
+ * The application's request is a fanout op; each page a fanned out request
+ * of its own, whose argument is a rd_kafka_DescribeTopicPartitions_page_t.
+ * Merging a page asks for the next one, until the broker returns no cursor,
+ * so the application gets every topic at once. A topic spanning pages is
+ * merged into one TopicDescription.
+ *
+ */
+
+/**
+ * @brief A page of DescribeTopicPartitions: the request's argument, and
+ *        where the following page starts once parsed.
+ */
+typedef struct rd_kafka_DescribeTopicPartitions_page_s {
+        rd_list_t topics;         /**< (char *) Topics to describe, none for
+                                   *   all. */
+        char *cursor_topic;       /**< First topic of the page, NULL for the
+                                   *   first page. */
+        int32_t cursor_partition; /**< First partition of cursor_topic. */
+        char *next_topic;         /**< First topic of the next page, NULL if
+                                   *   this is the last one. Set by the
+                                   *   response parser. */
+        int32_t next_partition;   /**< First partition of next_topic. */
+} rd_kafka_DescribeTopicPartitions_page_t;
+
+static rd_kafka_DescribeTopicPartitions_page_t *
+rd_kafka_DescribeTopicPartitions_page_new(const rd_list_t *topics,
+                                          const char *cursor_topic,
+                                          int32_t cursor_partition) {
+        rd_kafka_DescribeTopicPartitions_page_t *page =
+            rd_calloc(1, sizeof(*page));
+
+        rd_list_init_copy(&page->topics, topics);
+        rd_list_copy_to(&page->topics, topics, rd_list_string_copy, NULL);
+        if (cursor_topic)
+                page->cursor_topic = rd_strdup(cursor_topic);
+        page->cursor_partition = cursor_partition;
+        page->next_partition   = -1;
+        return page;
+}
+
+static void rd_kafka_DescribeTopicPartitions_page_free(void *ptr) {
+        rd_kafka_DescribeTopicPartitions_page_t *page = ptr;
+
+        rd_list_destroy(&page->topics);
+        RD_IF_FREE(page->cursor_topic, rd_free);
+        RD_IF_FREE(page->next_topic, rd_free);
+        rd_free(page);
+}
+
+/**
+ * @returns a copy of \p src, including the Node without host of an unknown
+ *          broker (which rd_kafka_Node_copy() doesn't take).
+ */
+static rd_kafka_Node_t *
+rd_kafka_DescribeTopicPartitions_node_copy(const rd_kafka_Node_t *src) {
+        rd_kafka_Node_t *node;
+
+        if (src->host)
+                return rd_kafka_Node_copy(src);
+
+        node     = rd_calloc(1, sizeof(*node));
+        node->id = src->id;
+        return node;
+}
+
+/**
+ * @returns a copy of the \p cnt nodes of \p src, NULL if none.
+ */
+static rd_kafka_Node_t **
+rd_kafka_DescribeTopicPartitions_nodes_copy(rd_kafka_Node_t **src, size_t cnt) {
+        rd_kafka_Node_t **nodes;
+        size_t i;
+
+        if (!cnt)
+                return NULL;
+
+        nodes = rd_calloc(cnt, sizeof(*nodes));
+        for (i = 0; i < cnt; i++)
+                nodes[i] = rd_kafka_DescribeTopicPartitions_node_copy(src[i]);
+        return nodes;
+}
+
+/**
+ * @returns a copy of \p src.
+ */
+static rd_kafka_TopicPartitionInfo_t *
+rd_kafka_TopicPartitionInfo_copy(const rd_kafka_TopicPartitionInfo_t *src) {
+        rd_kafka_TopicPartitionInfo_t *pinfo = rd_calloc(1, sizeof(*pinfo));
+
+        pinfo->partition    = src->partition;
+        pinfo->leader_epoch = src->leader_epoch;
+        if (src->leader)
+                pinfo->leader =
+                    rd_kafka_DescribeTopicPartitions_node_copy(src->leader);
+
+        pinfo->isr_cnt = src->isr_cnt;
+        pinfo->isr =
+            rd_kafka_DescribeTopicPartitions_nodes_copy(src->isr, src->isr_cnt);
+        pinfo->replica_cnt = src->replica_cnt;
+        pinfo->replicas    = rd_kafka_DescribeTopicPartitions_nodes_copy(
+            src->replicas, src->replica_cnt);
+        pinfo->elr_cnt = src->elr_cnt;
+        pinfo->elr =
+            rd_kafka_DescribeTopicPartitions_nodes_copy(src->elr, src->elr_cnt);
+        pinfo->last_known_elr_cnt = src->last_known_elr_cnt;
+        pinfo->last_known_elr     = rd_kafka_DescribeTopicPartitions_nodes_copy(
+            src->last_known_elr, src->last_known_elr_cnt);
+        pinfo->offline_replica_cnt = src->offline_replica_cnt;
+        pinfo->offline_replicas = rd_kafka_DescribeTopicPartitions_nodes_copy(
+            src->offline_replicas, src->offline_replica_cnt);
+        return pinfo;
+}
+
+/**
+ * @brief Appends copies of the partitions of \p src to \p topicdesc.
+ */
+static void rd_kafka_TopicDescription_append_partitions(
+    rd_kafka_TopicDescription_t *topicdesc,
+    const rd_kafka_TopicDescription_t *src) {
+        int i;
+
+        if (!src->partition_cnt)
+                return;
+
+        topicdesc->partitions =
+            rd_realloc(topicdesc->partitions,
+                       sizeof(*topicdesc->partitions) *
+                           (topicdesc->partition_cnt + src->partition_cnt));
+        for (i = 0; i < src->partition_cnt; i++)
+                topicdesc->partitions[topicdesc->partition_cnt++] =
+                    rd_kafka_TopicPartitionInfo_copy(src->partitions[i]);
+}
+
+/**
+ * @returns a copy of \p src.
+ */
+static rd_kafka_TopicDescription_t *
+rd_kafka_TopicDescription_copy(const rd_kafka_TopicDescription_t *src) {
+        rd_kafka_TopicDescription_t *topicdesc =
+            rd_calloc(1, sizeof(*topicdesc));
+
+        topicdesc->topic       = rd_strdup(src->topic);
+        topicdesc->topic_id    = src->topic_id;
+        topicdesc->is_internal = src->is_internal;
+        if (src->error)
+                topicdesc->error = rd_kafka_error_copy(src->error);
+        topicdesc->authorized_operations_cnt = src->authorized_operations_cnt;
+        topicdesc->authorized_operations = rd_kafka_AuthorizedOperations_copy(
+            src->authorized_operations, src->authorized_operations_cnt);
+        rd_kafka_TopicDescription_append_partitions(topicdesc, src);
+        return topicdesc;
+}
+
+static void *rd_kafka_TopicDescription_copy_opaque(const void *src,
+                                                   void *opaque) {
+        return rd_kafka_TopicDescription_copy(src);
+}
+
+/**
+ * @returns a Node for the broker \p id, with the host and port the client
+ *          knows it by, from \p known (rd_kafka_Node_t *) when there,
+ *          else added to it. A broker the client doesn't know gets a Node
+ *          with its id only.
+ *
+ * @locality rdkafka main thread
+ * @locks none
+ */
+static rd_kafka_Node_t *rd_kafka_DescribeTopicPartitions_node(rd_kafka_t *rk,
+                                                              rd_list_t *known,
+                                                              int32_t id) {
+        rd_kafka_Node_t *node;
+        rd_kafka_broker_t *rkb;
+        int i;
+
+        RD_LIST_FOREACH(node, known, i) {
+                if (node->id == id)
+                        return rd_kafka_DescribeTopicPartitions_node_copy(node);
+        }
+
+        rd_kafka_rdlock(rk);
+        rkb = rd_kafka_broker_find_by_nodeid(rk, id);
+        rd_kafka_rdunlock(rk);
+        if (rkb) {
+                char host[RD_KAFKA_NODENAME_SIZE];
+                uint16_t port;
+
+                rd_kafka_broker_lock(rkb);
+                rd_kafka_nodename_to_hostname(rkb->rkb_nodename, host,
+                                              sizeof(host));
+                port = rkb->rkb_port;
+                rd_kafka_broker_unlock(rkb);
+                rd_kafka_broker_destroy(rkb);
+                node = rd_kafka_Node_new(id, host, port, NULL);
+        } else {
+                node     = rd_calloc(1, sizeof(*node));
+                node->id = id;
+        }
+
+        rd_list_add(known, node);
+        return rd_kafka_DescribeTopicPartitions_node_copy(node);
+}
+
+/**
+ * @brief Construct and send a DescribeTopicPartitionsRequest to \p rkb for
+ *        the page in \p args (one rd_kafka_DescribeTopicPartitions_page_t),
+ *        using \p options.
+ *
+ *        The response (unparsed) will be enqueued on \p replyq
+ *        for handling by \p resp_cb (with \p opaque passed).
+ *
+ * @returns RD_KAFKA_RESP_ERR_NO_ERROR if the request was enqueued for
+ *          transmission, otherwise an error code and errstr will be
+ *          updated with a human readable error string.
+ */
+static rd_kafka_resp_err_t
+rd_kafka_admin_DescribeTopicPartitionsRequest(rd_kafka_broker_t *rkb,
+                                              const rd_list_t *args,
+                                              rd_kafka_AdminOptions_t *options,
+                                              char *errstr,
+                                              size_t errstr_size,
+                                              rd_kafka_replyq_t replyq,
+                                              rd_kafka_resp_cb_t *resp_cb,
+                                              void *opaque) {
+        const rd_kafka_DescribeTopicPartitions_page_t *page =
+            rd_list_elem(args, 0);
+        rd_kafka_buf_t *rkbuf;
+        int16_t ApiVersion;
+        int features;
+        const char *topic;
+        int limit;
+        int i;
+
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(
+            rkb, RD_KAFKAP_DescribeTopicPartitions, 0, 0, &features);
+        if (ApiVersion == -1) {
+                rd_snprintf(errstr, errstr_size,
+                            "DescribeTopicPartitions API (KIP-966) not "
+                            "supported by broker, requires broker "
+                            "version >= 3.8.0");
+                return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
+        }
+
+        rkbuf = rd_kafka_buf_new_flexver_request(
+            rkb, RD_KAFKAP_DescribeTopicPartitions, 1,
+            rd_list_cnt(&page->topics) * 50 + 64, rd_true);
+
+        /* Topics: none for all */
+        rd_kafka_buf_write_arraycnt(rkbuf, rd_list_cnt(&page->topics));
+        RD_LIST_FOREACH(topic, &page->topics, i) {
+                /* Name */
+                rd_kafka_buf_write_str(rkbuf, topic, -1);
+                rd_kafka_buf_write_tags_empty(rkbuf);
+        }
+
+        /* ResponsePartitionLimit: options made for another API don't set
+         * it, the broker's default then */
+        limit = rd_kafka_confval_get_int(
+            &options->partition_size_limit_per_response);
+        rd_kafka_buf_write_i32(rkbuf, limit > 0 ? limit : 2000);
+
+        /* Cursor: nullable struct */
+        if (page->cursor_topic) {
+                rd_kafka_buf_write_i8(rkbuf, 1);
+                /* TopicName */
+                rd_kafka_buf_write_str(rkbuf, page->cursor_topic, -1);
+                /* PartitionIndex */
+                rd_kafka_buf_write_i32(rkbuf, page->cursor_partition);
+                rd_kafka_buf_write_tags_empty(rkbuf);
+        } else {
+                rd_kafka_buf_write_i8(rkbuf, -1);
+        }
+
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
+        /* Last Tag buffer included automatically */
+        rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+/**
+ * @brief Reads an array of broker ids into Nodes in \p nodesp and
+ *        \p cntp: ownership is handed over before reading the ids, so the
+ *        caller frees what was read when a read fails.
+ *
+ * @param nullable Whether the array may be null (none).
+ *
+ * @returns 0 on success, -1 on parse failure (\p rkbuf's error set).
+ */
+static int
+rd_kafka_DescribeTopicPartitions_read_nodes(rd_kafka_buf_t *rkbuf,
+                                            rd_kafka_t *rk,
+                                            rd_list_t *known,
+                                            rd_kafka_Node_t ***nodesp,
+                                            size_t *cntp,
+                                            rd_bool_t nullable) {
+        const int log_decode_errors = LOG_ERR;
+        int32_t cnt;
+        int32_t i;
+
+        rd_kafka_buf_read_arraycnt(rkbuf, &cnt, RD_KAFKAP_BROKERS_MAX);
+        if (cnt < 0 && !nullable)
+                rd_kafka_buf_parse_fail(
+                    rkbuf, "Node ids %" PRId32 " out of range", cnt);
+        if (cnt <= 0)
+                return 0;
+
+        *nodesp = rd_calloc(cnt, sizeof(**nodesp));
+        if (!*nodesp)
+                rd_kafka_buf_parse_fail(rkbuf, "Failed to allocate nodes");
+
+        for (i = 0; i < cnt; i++) {
+                int32_t id;
+                rd_kafka_buf_read_i32(rkbuf, &id);
+                (*nodesp)[(*cntp)++] =
+                    rd_kafka_DescribeTopicPartitions_node(rk, known, id);
+        }
+        return 0;
+
+err_parse:
+        return -1;
+}
+
+/**
+ * @brief Parse a DescribeTopicPartitionsResponse, a page, into an
+ *        ADMIN_RESULT op of its TopicDescriptions: the cursor of the next
+ *        page goes on the page, the result's argument.
+ */
+static rd_kafka_resp_err_t
+rd_kafka_DescribeTopicPartitionsResponse_parse(rd_kafka_op_t *rko_req,
+                                               rd_kafka_op_t **rko_resultp,
+                                               rd_kafka_buf_t *reply,
+                                               char *errstr,
+                                               size_t errstr_size) {
+        const int log_decode_errors = LOG_ERR;
+        rd_kafka_t *rk              = rko_req->rko_rk;
+        rd_kafka_op_t *rko_result   = NULL;
+        rd_kafka_DescribeTopicPartitions_page_t *page;
+        rd_list_t known; /* (rd_kafka_Node_t *) brokers looked up */
+        rd_bool_t include_authorized_operations =
+            rd_kafka_confval_get_int(&rko_req->rko_u.admin_request.options
+                                          .include_authorized_operations);
+        int32_t topic_cnt;
+        int32_t i;
+        int8_t cursor;
+
+        rd_list_init(&known, 0, rd_kafka_Node_free);
+
+        rko_result = rd_kafka_admin_result_new(rko_req);
+        page       = rd_list_elem(&rko_result->rko_u.admin_result.args, 0);
+
+        /* ThrottleTimeMs */
+        rd_kafka_buf_read_throttle_time(reply);
+
+        /* Topics */
+        rd_kafka_buf_read_arraycnt(reply, &topic_cnt, RD_KAFKAP_TOPICS_MAX);
+        if (topic_cnt < 0)
+                rd_kafka_buf_parse_fail(
+                    reply, "Topics %" PRId32 " out of range", topic_cnt);
+        rd_list_init(&rko_result->rko_u.admin_result.results, topic_cnt,
+                     rd_kafka_TopicDescription_free);
+
+        for (i = 0; i < topic_cnt; i++) {
+                rd_kafka_TopicDescription_t *topicdesc;
+                int16_t ErrorCode;
+                rd_kafkap_str_t Name;
+                int32_t partition_cnt;
+                int32_t TopicAuthorizedOperations;
+                int32_t j;
+
+                /* Owned by the results from here: freed with them if a read
+                 * below fails. */
+                topicdesc = rd_calloc(1, sizeof(*topicdesc));
+                if (!topicdesc)
+                        rd_kafka_buf_parse_fail(reply,
+                                                "Failed to allocate topic");
+                topicdesc->authorized_operations_cnt = -1;
+                rd_list_add(&rko_result->rko_u.admin_result.results, topicdesc);
+
+                /* ErrorCode */
+                rd_kafka_buf_read_i16(reply, &ErrorCode);
+                /* Name: nullable, e.g. for an unknown topic id */
+                rd_kafka_buf_read_str(reply, &Name);
+                topicdesc->topic = RD_KAFKAP_STR_IS_NULL(&Name)
+                                       ? rd_strdup("")
+                                       : RD_KAFKAP_STR_DUP(&Name);
+                /* TopicId */
+                rd_kafka_buf_read_uuid(reply, &topicdesc->topic_id);
+                /* IsInternal */
+                rd_kafka_buf_read_bool(reply, &topicdesc->is_internal);
+
+                /* Partitions */
+                rd_kafka_buf_read_arraycnt(reply, &partition_cnt,
+                                           RD_KAFKAP_PARTITIONS_MAX);
+                if (partition_cnt < 0)
+                        rd_kafka_buf_parse_fail(
+                            reply, "Partitions %" PRId32 " out of range",
+                            partition_cnt);
+                if (partition_cnt > 0) {
+                        topicdesc->partitions = rd_calloc(
+                            partition_cnt, sizeof(*topicdesc->partitions));
+                        if (!topicdesc->partitions)
+                                rd_kafka_buf_parse_fail(
+                                    reply, "Failed to allocate partitions");
+                }
+
+                for (j = 0; j < partition_cnt; j++) {
+                        rd_kafka_TopicPartitionInfo_t *pinfo;
+                        int16_t PartitionErrorCode;
+                        int32_t LeaderId;
+
+                        /* Owned by the topic from here, as above. */
+                        pinfo = rd_calloc(1, sizeof(*pinfo));
+                        if (!pinfo)
+                                rd_kafka_buf_parse_fail(
+                                    reply, "Failed to allocate partition");
+                        topicdesc->partitions[topicdesc->partition_cnt++] =
+                            pinfo;
+
+                        /* ErrorCode: e.g. LEADER_NOT_AVAILABLE, told by the
+                         * leader and ISR */
+                        rd_kafka_buf_read_i16(reply, &PartitionErrorCode);
+                        /* PartitionIndex */
+                        rd_kafka_buf_read_i32(reply, &pinfo->partition);
+                        /* LeaderId */
+                        rd_kafka_buf_read_i32(reply, &LeaderId);
+                        if (LeaderId >= 0)
+                                pinfo->leader =
+                                    rd_kafka_DescribeTopicPartitions_node(
+                                        rk, &known, LeaderId);
+                        /* LeaderEpoch */
+                        rd_kafka_buf_read_i32(reply, &pinfo->leader_epoch);
+                        /* ReplicaNodes */
+                        if (rd_kafka_DescribeTopicPartitions_read_nodes(
+                                reply, rk, &known, &pinfo->replicas,
+                                &pinfo->replica_cnt, rd_false) == -1)
+                                goto err_parse;
+                        /* IsrNodes */
+                        if (rd_kafka_DescribeTopicPartitions_read_nodes(
+                                reply, rk, &known, &pinfo->isr, &pinfo->isr_cnt,
+                                rd_false) == -1)
+                                goto err_parse;
+                        /* EligibleLeaderReplicas: nullable */
+                        if (rd_kafka_DescribeTopicPartitions_read_nodes(
+                                reply, rk, &known, &pinfo->elr, &pinfo->elr_cnt,
+                                rd_true) == -1)
+                                goto err_parse;
+                        /* LastKnownElr: nullable */
+                        if (rd_kafka_DescribeTopicPartitions_read_nodes(
+                                reply, rk, &known, &pinfo->last_known_elr,
+                                &pinfo->last_known_elr_cnt, rd_true) == -1)
+                                goto err_parse;
+                        /* OfflineReplicas */
+                        if (rd_kafka_DescribeTopicPartitions_read_nodes(
+                                reply, rk, &known, &pinfo->offline_replicas,
+                                &pinfo->offline_replica_cnt, rd_false) == -1)
+                                goto err_parse;
+                        rd_kafka_buf_skip_tags(reply);
+
+                        if (PartitionErrorCode)
+                                rd_rkb_dbg(
+                                    reply->rkbuf_rkb, ADMIN,
+                                    "DESCRIBETOPICPARTITIONS",
+                                    "Partition %s [%" PRId32 "]: %s",
+                                    topicdesc->topic, pinfo->partition,
+                                    rd_kafka_err2name(PartitionErrorCode));
+                }
+
+                /* TopicAuthorizedOperations */
+                rd_kafka_buf_read_i32(reply, &TopicAuthorizedOperations);
+                if (include_authorized_operations)
+                        topicdesc->authorized_operations =
+                            rd_kafka_AuthorizedOperations_parse(
+                                TopicAuthorizedOperations,
+                                &topicdesc->authorized_operations_cnt);
+                rd_kafka_buf_skip_tags(reply);
+
+                if (ErrorCode)
+                        topicdesc->error = rd_kafka_error_new(
+                            ErrorCode, "%s", rd_kafka_err2str(ErrorCode));
+        }
+
+        /* NextCursor: nullable struct */
+        rd_kafka_buf_read_i8(reply, &cursor);
+        if (cursor == 1) {
+                rd_kafkap_str_t TopicName;
+                /* TopicName */
+                rd_kafka_buf_read_str(reply, &TopicName);
+                if (RD_KAFKAP_STR_IS_NULL(&TopicName))
+                        rd_kafka_buf_parse_fail(reply,
+                                                "NextCursor without a topic");
+                page->next_topic = RD_KAFKAP_STR_DUP(&TopicName);
+                /* PartitionIndex */
+                rd_kafka_buf_read_i32(reply, &page->next_partition);
+                rd_kafka_buf_skip_tags(reply);
+        } else if (cursor != -1) {
+                rd_kafka_buf_parse_fail(
+                    reply, "NextCursor marker %d out of range", (int)cursor);
+        }
+
+        rd_list_destroy(&known);
+        *rko_resultp = rko_result;
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+
+err_parse:
+        rd_list_destroy(&known);
+        RD_IF_FREE(rko_result, rd_kafka_op_destroy);
+        rd_snprintf(errstr, errstr_size,
+                    "DescribeTopicPartitions response protocol parse "
+                    "failure: %s",
+                    rd_kafka_err2str(reply->rkbuf_err));
+        return reply->rkbuf_err;
+}
+
+/**
+ * @brief Enqueues the request of the page starting at \p cursor_topic,
+ *        \p cursor_partition (NULL for the first) of \p rko_fanout.
+ *
+ * @remark The caller accounts for it in the fanout's outstanding count.
+ */
+static void
+rd_kafka_DescribeTopicPartitions_page_request(rd_kafka_op_t *rko_fanout,
+                                              const char *cursor_topic,
+                                              int32_t cursor_partition) {
+        static const struct rd_kafka_admin_worker_cbs cbs = {
+            rd_kafka_admin_DescribeTopicPartitionsRequest,
+            rd_kafka_DescribeTopicPartitionsResponse_parse,
+        };
+        rd_kafka_t *rk = rko_fanout->rko_rk;
+        rd_kafka_op_t *rko;
+
+        rko = rd_kafka_admin_request_op_new(
+            rk, RD_KAFKA_OP_DESCRIBETOPICPARTITIONS,
+            RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT, &cbs,
+            &rko_fanout->rko_u.admin_request.options, rk->rk_ops);
+        rko->rko_u.admin_request.fanout_parent = rko_fanout;
+        /* request_timeout is for the whole request: every page shares its
+         * deadline */
+        rko->rko_u.admin_request.abs_timeout =
+            rko_fanout->rko_u.admin_request.abs_timeout;
+
+        rd_list_init(&rko->rko_u.admin_request.args, 1,
+                     rd_kafka_DescribeTopicPartitions_page_free);
+        rd_list_add(&rko->rko_u.admin_request.args,
+                    rd_kafka_DescribeTopicPartitions_page_new(
+                        &rko_fanout->rko_u.admin_request.args, cursor_topic,
+                        cursor_partition));
+
+        rd_kafka_q_enq(rk->rk_ops, rko);
+}
+
+/**
+ * @brief Fails the whole DescribeTopicPartitions request \p rko_fanout:
+ *        its result is this error, without topics.
+ */
+static RD_FORMAT(printf, 3, 4) void rd_kafka_DescribeTopicPartitions_fail(
+    rd_kafka_op_t *rko_fanout,
+    rd_kafka_resp_err_t err,
+    const char *fmt,
+    ...) {
+        char errstr[512];
+        va_list ap;
+
+        if (rko_fanout->rko_error)
+                return; /* The first error tells */
+
+        va_start(ap, fmt);
+        rd_vsnprintf(errstr, sizeof(errstr), fmt, ap);
+        va_end(ap);
+        rko_fanout->rko_error = rd_kafka_error_new(err, "%s", errstr);
+}
+
+/**
+ * @brief Merges a page \p rko_partial into the topics of \p rko_fanout, and
+ *        asks for the next page, if any.
+ */
+static void rd_kafka_DescribeTopicPartitions_response_merge(
+    rd_kafka_op_t *rko_fanout,
+    const rd_kafka_op_t *rko_partial) {
+        rd_list_t *topics  = &rko_fanout->rko_u.admin_request.args;
+        rd_list_t *results = &rko_fanout->rko_u.admin_request.fanout.results;
+        const rd_kafka_DescribeTopicPartitions_page_t *page;
+        const rd_kafka_TopicDescription_t *partial;
+        rd_bool_t named = rd_list_cnt(topics) > 0;
+        int i;
+
+        rd_assert(rko_partial->rko_evtype ==
+                  RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT);
+
+        if (rko_fanout->rko_error)
+                return; /* Failed already */
+
+        if (rko_partial->rko_err) {
+                rd_kafka_DescribeTopicPartitions_fail(
+                    rko_fanout, rko_partial->rko_err, "%s",
+                    rko_partial->rko_u.admin_result.errstr
+                        ? rko_partial->rko_u.admin_result.errstr
+                        : rd_kafka_err2str(rko_partial->rko_err));
+                return;
+        }
+
+        RD_LIST_FOREACH(partial, &rko_partial->rko_u.admin_result.results, i) {
+                rd_kafka_TopicDescription_t *topicdesc = NULL;
+                int pos                                = -1;
+
+                if (named) {
+                        /* In the requested order */
+                        pos = rd_list_index(topics, partial->topic,
+                                            rd_kafka_DescribeTopics_cmp);
+                        if (pos == -1) {
+                                rd_kafka_DescribeTopicPartitions_fail(
+                                    rko_fanout, RD_KAFKA_RESP_ERR__BAD_MSG,
+                                    "Broker returned topic %s that was not "
+                                    "included in the original request",
+                                    partial->topic);
+                                return;
+                        }
+                        topicdesc = rd_list_elem(results, pos);
+                } else if (rd_list_cnt(results) > 0) {
+                        /* In the broker's order: a topic continues on the
+                         * next page */
+                        rd_kafka_TopicDescription_t *last =
+                            rd_list_last(results);
+                        if (!strcmp(last->topic, partial->topic))
+                                topicdesc = last;
+                }
+
+                if (topicdesc)
+                        rd_kafka_TopicDescription_append_partitions(topicdesc,
+                                                                    partial);
+                else if (named)
+                        rd_list_set(results, pos,
+                                    rd_kafka_TopicDescription_copy(partial));
+                else
+                        rd_list_add(results,
+                                    rd_kafka_TopicDescription_copy(partial));
+        }
+
+        page = rd_list_elem(&rko_partial->rko_u.admin_result.args, 0);
+        if (page && page->next_topic) {
+                if (page->cursor_topic &&
+                    !strcmp(page->next_topic, page->cursor_topic) &&
+                    page->next_partition == page->cursor_partition) {
+                        rd_kafka_DescribeTopicPartitions_fail(
+                            rko_fanout, RD_KAFKA_RESP_ERR__BAD_MSG,
+                            "Broker returned the page's own cursor %s [%" PRId32
+                            "] as the next one",
+                            page->next_topic, page->next_partition);
+                        return;
+                }
+                rko_fanout->rko_u.admin_request.fanout.outstanding++;
+                rd_kafka_DescribeTopicPartitions_page_request(
+                    rko_fanout, page->next_topic, page->next_partition);
+                return;
+        }
+
+        /* The last page: a named topic the broker left out is an error */
+        if (named) {
+                char *topic;
+                RD_LIST_FOREACH(topic, topics, i) {
+                        rd_kafka_error_t *error;
+
+                        if (rd_list_elem(results, i))
+                                continue;
+                        error = rd_kafka_error_new(
+                            RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART,
+                            "Topic not returned by the broker");
+                        rd_list_set(results, i,
+                                    rd_kafka_TopicDescription_new_error(
+                                        topic, RD_KAFKA_UUID_ZERO, error));
+                        rd_kafka_error_destroy(error);
+                }
+        }
+}
+
+void rd_kafka_DescribeTopicPartitions(rd_kafka_t *rk,
+                                      const rd_kafka_TopicCollection_t *topics,
+                                      const rd_kafka_AdminOptions_t *options,
+                                      rd_kafka_queue_t *rkqu) {
+        static const struct rd_kafka_admin_fanout_worker_cbs fanout_cbs = {
+            rd_kafka_DescribeTopicPartitions_response_merge,
+            rd_kafka_TopicDescription_copy_opaque,
+        };
+        rd_kafka_op_t *rko_fanout;
+        rd_list_t dup_list;
+        size_t i;
+
+        rd_assert(rkqu);
+
+        rko_fanout = rd_kafka_admin_fanout_op_new(
+            rk, RD_KAFKA_OP_DESCRIBETOPICPARTITIONS,
+            RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT, &fanout_cbs, options,
+            rkqu->rkqu_q);
+
+        /* The topics, in the order of the results; none for all */
+        rd_list_init(&rko_fanout->rko_u.admin_request.args,
+                     (int)topics->topics_cnt, rd_free);
+        for (i = 0; i < topics->topics_cnt; i++)
+                rd_list_add(&rko_fanout->rko_u.admin_request.args,
+                            rd_strdup(topics->topics[i]));
+
+        if (topics->topics_cnt) {
+                char *topic_name;
+                int j;
+
+                /* Check for duplicates, on a sorted copy: the results keep
+                 * the requested order. */
+                rd_list_init(&dup_list,
+                             rd_list_cnt(&rko_fanout->rko_u.admin_request.args),
+                             NULL);
+                rd_list_copy_to(&dup_list,
+                                &rko_fanout->rko_u.admin_request.args, NULL,
+                                NULL);
+                rd_list_sort(&dup_list, rd_kafka_DescribeTopics_cmp);
+                if (rd_list_find_duplicate(&dup_list,
+                                           rd_kafka_DescribeTopics_cmp)) {
+                        rd_list_destroy(&dup_list);
+                        rd_kafka_admin_result_fail(
+                            rko_fanout, RD_KAFKA_RESP_ERR__INVALID_ARG,
+                            "Duplicate topics not allowed");
+                        rd_kafka_admin_common_worker_destroy(
+                            rk, rko_fanout, rd_true /*destroy*/);
+                        return;
+                }
+                rd_list_destroy(&dup_list);
+
+                /* Check for empty topics. */
+                RD_LIST_FOREACH(topic_name,
+                                &rko_fanout->rko_u.admin_request.args, j) {
+                        if (!topic_name[0]) {
+                                rd_kafka_admin_result_fail(
+                                    rko_fanout, RD_KAFKA_RESP_ERR__INVALID_ARG,
+                                    "Empty topic name at index %d isn't "
+                                    "allowed",
+                                    j);
+                                rd_kafka_admin_common_worker_destroy(
+                                    rk, rko_fanout, rd_true /*destroy*/);
+                                return;
+                        }
+                }
+        }
+
+        /* The topics, as the pages describe them */
+        rd_list_init(&rko_fanout->rko_u.admin_request.fanout.results,
+                     topics->topics_cnt ? (int)topics->topics_cnt : 16,
+                     rd_kafka_TopicDescription_free);
+
+        /* The first page: the next ones as the pages tell */
+        rko_fanout->rko_u.admin_request.fanout.outstanding = 1;
+        rd_kafka_DescribeTopicPartitions_page_request(rko_fanout, NULL, -1);
+}
+
+const rd_kafka_TopicDescription_t **
+rd_kafka_DescribeTopicPartitions_result_topics(
+    const rd_kafka_DescribeTopicPartitions_result_t *result,
+    size_t *cntp) {
+        const rd_kafka_op_t *rko = (const rd_kafka_op_t *)result;
+        rd_kafka_op_type_t reqtype =
+            rko->rko_u.admin_result.reqtype & ~RD_KAFKA_OP_FLAGMASK;
+        rd_assert(reqtype == RD_KAFKA_OP_DESCRIBETOPICPARTITIONS);
+
+        *cntp = rd_list_cnt(&rko->rko_u.admin_result.results);
+        return (const rd_kafka_TopicDescription_t **)
+            rko->rko_u.admin_result.results.rl_elems;
 }
 
 /**@}*/
@@ -10165,9 +11010,395 @@ static int ut_ListConsumerGroups_response_merge(void) {
         RD_UT_PASS();
 }
 
+/**
+ * @name DescribeTopicPartitions unit tests
+ * @{
+ */
+
+/**
+ * @brief A DescribeTopicPartitions request op for the first page of
+ *        \p topics, as the parser gets it.
+ */
+static rd_kafka_op_t *ut_make_DescribeTopicPartitions_request(
+    rd_kafka_t *rk,
+    rd_kafka_q_t *rkq,
+    const char **topics,
+    int topic_cnt,
+    rd_bool_t include_authorized_operations) {
+        static const struct rd_kafka_admin_worker_cbs cbs = {
+            rd_kafka_admin_DescribeTopicPartitionsRequest,
+            rd_kafka_DescribeTopicPartitionsResponse_parse,
+        };
+        rd_kafka_AdminOptions_t *options = rd_kafka_AdminOptions_new(
+            rk, RD_KAFKA_ADMIN_OP_DESCRIBETOPICPARTITIONS);
+        rd_kafka_error_t *error;
+        rd_kafka_op_t *rko;
+        rd_list_t names;
+        int i;
+
+        error = rd_kafka_AdminOptions_set_include_authorized_operations(
+            options, include_authorized_operations);
+        rd_assert(!error);
+        rko = rd_kafka_admin_request_op_new(
+            rk, RD_KAFKA_OP_DESCRIBETOPICPARTITIONS,
+            RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT, &cbs, options, rkq);
+        rd_kafka_AdminOptions_destroy(options);
+
+        rd_list_init(&names, topic_cnt, rd_free);
+        for (i = 0; i < topic_cnt; i++)
+                rd_list_add(&names, rd_strdup(topics[i]));
+        rd_list_init(&rko->rko_u.admin_request.args, 1,
+                     rd_kafka_DescribeTopicPartitions_page_free);
+        rd_list_add(
+            &rko->rko_u.admin_request.args,
+            rd_kafka_DescribeTopicPartitions_page_new(&names, NULL, -1));
+        rd_list_destroy(&names);
+
+        return rko;
+}
+
+/**
+ * @brief A flexver response buffer from \p rkb, to write a response in.
+ */
+static rd_kafka_buf_t *
+ut_DescribeTopicPartitions_response(rd_kafka_broker_t *rkb) {
+        rd_kafka_buf_t *rkbuf = rd_kafka_buf_new(0, 0);
+
+        /* Released when the buffer is destroyed */
+        rd_kafka_broker_keep(rkb);
+        rkbuf->rkbuf_rkb = rkb;
+        rkbuf->rkbuf_flags |= RD_KAFKA_OP_F_FLEXVER;
+        return rkbuf;
+}
+
+/**
+ * @brief Writes a partition, led by \p leader, of \p replicas in sync.
+ */
+static void ut_write_DescribeTopicPartitions_partition(rd_kafka_buf_t *rkbuf,
+                                                       int32_t partition,
+                                                       int32_t leader,
+                                                       int32_t replicas) {
+        int32_t i;
+
+        rd_kafka_buf_write_i16(rkbuf, 0);             /* ErrorCode */
+        rd_kafka_buf_write_i32(rkbuf, partition);     /* PartitionIndex */
+        rd_kafka_buf_write_i32(rkbuf, leader);        /* LeaderId */
+        rd_kafka_buf_write_i32(rkbuf, 7);             /* LeaderEpoch */
+        rd_kafka_buf_write_arraycnt(rkbuf, replicas); /* ReplicaNodes */
+        for (i = 0; i < replicas; i++)
+                rd_kafka_buf_write_i32(rkbuf, i + 1);
+        rd_kafka_buf_write_arraycnt(rkbuf, replicas); /* IsrNodes */
+        for (i = 0; i < replicas; i++)
+                rd_kafka_buf_write_i32(rkbuf, i + 1);
+        rd_kafka_buf_write_arraycnt(rkbuf, 1); /* EligibleLeaderReplicas */
+        rd_kafka_buf_write_i32(rkbuf, 3);
+        rd_kafka_buf_write_arraycnt(rkbuf, -1); /* LastKnownElr: null */
+        rd_kafka_buf_write_arraycnt(rkbuf, 0);  /* OfflineReplicas */
+        rd_kafka_buf_write_tags_empty(rkbuf);
+}
+
+/**
+ * @brief Writes a topic, without its partitions: write \p partition_cnt of
+ *        them after, then ut_write_DescribeTopicPartitions_topic_end().
+ */
+static void ut_write_DescribeTopicPartitions_topic(rd_kafka_buf_t *rkbuf,
+                                                   int16_t err,
+                                                   const char *topic,
+                                                   int32_t partition_cnt) {
+        rd_kafka_Uuid_t topic_id = RD_KAFKA_UUID_ZERO;
+
+        rd_kafka_buf_write_i16(rkbuf, err);                /* ErrorCode */
+        rd_kafka_buf_write_str(rkbuf, topic, -1);          /* Name */
+        rd_kafka_buf_write_uuid(rkbuf, &topic_id);         /* TopicId */
+        rd_kafka_buf_write_bool(rkbuf, rd_false);          /* IsInternal */
+        rd_kafka_buf_write_arraycnt(rkbuf, partition_cnt); /* Partitions */
+}
+
+static void ut_write_DescribeTopicPartitions_topic_end(rd_kafka_buf_t *rkbuf) {
+        /* TopicAuthorizedOperations: READ | DESCRIBE */
+        rd_kafka_buf_write_i32(rkbuf,
+                               (1 << RD_KAFKA_ACL_OPERATION_READ) |
+                                   (1 << RD_KAFKA_ACL_OPERATION_DESCRIBE));
+        rd_kafka_buf_write_tags_empty(rkbuf);
+}
+
+/**
+ * @brief Parses \p reply for \p rko_req: returns the error, and the result
+ *        in \p rko_resultp.
+ */
+static rd_kafka_resp_err_t
+ut_parse_DescribeTopicPartitions(rd_kafka_op_t *rko_req,
+                                 rd_kafka_buf_t *reply,
+                                 rd_kafka_op_t **rko_resultp) {
+        char errstr[512];
+
+        rd_slice_init_full(&reply->rkbuf_reader, &reply->rkbuf_buf);
+        *rko_resultp = NULL;
+        return rd_kafka_DescribeTopicPartitionsResponse_parse(
+            rko_req, rko_resultp, reply, errstr, sizeof(errstr));
+}
+
+/**
+ * @brief Parsing a well-formed page.
+ */
+static int ut_DescribeTopicPartitions_parse(rd_kafka_t *rk,
+                                            rd_kafka_q_t *rkq,
+                                            rd_kafka_broker_t *rkb) {
+        const char *topics[] = {"orders", "nope"};
+        const rd_kafka_DescribeTopicPartitions_page_t *page;
+        const rd_kafka_TopicDescription_t *orders, *nope;
+        const rd_kafka_TopicPartitionInfo_t *pinfo;
+        const rd_kafka_Node_t **nodes;
+        rd_kafka_op_t *rko_req, *rko_result;
+        rd_kafka_buf_t *reply;
+        rd_kafka_resp_err_t err;
+        size_t cnt;
+
+        RD_UT_SAY("DescribeTopicPartitions: a page with a cursor");
+
+        rko_req = ut_make_DescribeTopicPartitions_request(rk, rkq, topics, 2,
+                                                          rd_true);
+        reply   = ut_DescribeTopicPartitions_response(rkb);
+        rd_kafka_buf_write_i32(reply, 0);      /* ThrottleTimeMs */
+        rd_kafka_buf_write_arraycnt(reply, 2); /* Topics */
+        ut_write_DescribeTopicPartitions_topic(reply, 0, "orders", 2);
+        ut_write_DescribeTopicPartitions_partition(reply, 0, 1, 2);
+        ut_write_DescribeTopicPartitions_partition(reply, 1, -1, 2);
+        ut_write_DescribeTopicPartitions_topic_end(reply);
+        ut_write_DescribeTopicPartitions_topic(
+            reply, RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART, "nope", 0);
+        ut_write_DescribeTopicPartitions_topic_end(reply);
+        rd_kafka_buf_write_i8(reply, 1); /* NextCursor */
+        rd_kafka_buf_write_str(reply, "orders", -1);
+        rd_kafka_buf_write_i32(reply, 2);
+        rd_kafka_buf_write_tags_empty(reply);
+        rd_kafka_buf_write_tags_empty(reply);
+
+        err = ut_parse_DescribeTopicPartitions(rko_req, reply, &rko_result);
+        RD_UT_ASSERT(!err, "parse failed: %s", rd_kafka_err2str(err));
+        RD_UT_ASSERT(rd_list_cnt(&rko_result->rko_u.admin_result.results) == 2,
+                     "expected 2 topics, got %d",
+                     rd_list_cnt(&rko_result->rko_u.admin_result.results));
+
+        orders = rd_list_elem(&rko_result->rko_u.admin_result.results, 0);
+        RD_UT_ASSERT(!strcmp(orders->topic, "orders") && !orders->error,
+                     "unexpected first topic %s", orders->topic);
+        RD_UT_ASSERT(orders->partition_cnt == 2, "expected 2 partitions");
+        RD_UT_ASSERT(orders->authorized_operations_cnt == 2,
+                     "expected 2 authorized operations, got %d",
+                     orders->authorized_operations_cnt);
+
+        pinfo = orders->partitions[0];
+        RD_UT_ASSERT(pinfo->leader && pinfo->leader->id == 1,
+                     "expected leader 1");
+        /* The client doesn't know broker 1: its id only */
+        RD_UT_ASSERT(!pinfo->leader->host, "expected no host");
+        RD_UT_ASSERT(rd_kafka_TopicPartitionInfo_leader_epoch(pinfo) == 7,
+                     "expected leader epoch 7");
+        nodes = rd_kafka_TopicPartitionInfo_replicas(pinfo, &cnt);
+        RD_UT_ASSERT(cnt == 2 && nodes[1]->id == 2, "expected replicas 1,2");
+        nodes =
+            rd_kafka_TopicPartitionInfo_eligible_leader_replicas(pinfo, &cnt);
+        RD_UT_ASSERT(cnt == 1 && nodes[0]->id == 3, "expected ELR 3");
+        rd_kafka_TopicPartitionInfo_last_known_eligible_leader_replicas(pinfo,
+                                                                        &cnt);
+        RD_UT_ASSERT(cnt == 0, "expected no last known ELR (null)");
+        RD_UT_ASSERT(!orders->partitions[1]->leader,
+                     "expected no leader for partition 1");
+
+        nope = rd_list_elem(&rko_result->rko_u.admin_result.results, 1);
+        RD_UT_ASSERT(nope->error && rd_kafka_error_code(nope->error) ==
+                                        RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART,
+                     "expected nope to be unknown");
+
+        page = rd_list_elem(&rko_result->rko_u.admin_result.args, 0);
+        RD_UT_ASSERT(page->next_topic && !strcmp(page->next_topic, "orders") &&
+                         page->next_partition == 2,
+                     "expected the next cursor orders [2]");
+
+        rd_kafka_op_destroy(rko_result);
+        rd_kafka_op_destroy(rko_req);
+        rd_kafka_buf_destroy(reply);
+        RD_UT_PASS();
+}
+
+/**
+ * @brief Malformed pages are rejected, without crash nor leak (#5580).
+ */
+static int ut_DescribeTopicPartitions_parse_malformed(rd_kafka_t *rk,
+                                                      rd_kafka_q_t *rkq,
+                                                      rd_kafka_broker_t *rkb) {
+        static const char *cases[] = {
+            "Topics -1",
+            "Topics over the cap",
+            "Partitions over the cap",
+            "null ReplicaNodes",
+            "truncated in a partition",
+            "NextCursor marker 2",
+        };
+        size_t c;
+
+        for (c = 0; c < RD_ARRAYSIZE(cases); c++) {
+                rd_kafka_op_t *rko_req, *rko_result;
+                rd_kafka_buf_t *reply;
+                rd_kafka_resp_err_t err;
+
+                RD_UT_SAY("DescribeTopicPartitions: rejects %s", cases[c]);
+
+                rko_req = ut_make_DescribeTopicPartitions_request(rk, rkq, NULL,
+                                                                  0, rd_false);
+                reply   = ut_DescribeTopicPartitions_response(rkb);
+                rd_kafka_buf_write_i32(reply, 0); /* ThrottleTimeMs */
+
+                switch (c) {
+                case 0:
+                        rd_kafka_buf_write_arraycnt(reply, -1);
+                        break;
+                case 1:
+                        rd_kafka_buf_write_arraycnt(reply,
+                                                    RD_KAFKAP_TOPICS_MAX + 1);
+                        break;
+                case 2:
+                        rd_kafka_buf_write_arraycnt(reply, 1);
+                        ut_write_DescribeTopicPartitions_topic(
+                            reply, 0, "orders", RD_KAFKAP_PARTITIONS_MAX + 1);
+                        break;
+                case 3:
+                        rd_kafka_buf_write_arraycnt(reply, 1);
+                        ut_write_DescribeTopicPartitions_topic(reply, 0,
+                                                               "orders", 1);
+                        rd_kafka_buf_write_i16(reply, 0); /* ErrorCode */
+                        rd_kafka_buf_write_i32(reply, 0); /* PartitionIndex */
+                        rd_kafka_buf_write_i32(reply, 1); /* LeaderId */
+                        rd_kafka_buf_write_i32(reply, 0); /* LeaderEpoch */
+                        rd_kafka_buf_write_arraycnt(reply, -1); /* Replicas */
+                        break;
+                case 4:
+                        rd_kafka_buf_write_arraycnt(reply, 1);
+                        ut_write_DescribeTopicPartitions_topic(reply, 0,
+                                                               "orders", 2);
+                        ut_write_DescribeTopicPartitions_partition(reply, 0, 1,
+                                                                   3);
+                        rd_kafka_buf_write_i16(reply, 0); /* ErrorCode */
+                        rd_kafka_buf_write_i32(reply, 1); /* PartitionIndex */
+                        break;
+                case 5:
+                        rd_kafka_buf_write_arraycnt(reply, 0);
+                        rd_kafka_buf_write_i8(reply, 2); /* NextCursor */
+                        rd_kafka_buf_write_tags_empty(reply);
+                        break;
+                }
+
+                err = ut_parse_DescribeTopicPartitions(rko_req, reply,
+                                                       &rko_result);
+                RD_UT_ASSERT(err, "%s: expected a parse failure", cases[c]);
+                RD_UT_ASSERT(!rko_result, "%s: expected no result", cases[c]);
+
+                rd_kafka_op_destroy(rko_req);
+                rd_kafka_buf_destroy(reply);
+        }
+
+        RD_UT_PASS();
+}
+
+/**
+ * @brief A page whose result is \p topic, with partitions \p first to
+ *        \p last, as the fanout merges it.
+ */
+static rd_kafka_op_t *ut_make_DescribeTopicPartitions_partial(const char *topic,
+                                                              int first,
+                                                              int last) {
+        rd_kafka_op_t *rko_partial = rd_kafka_op_new(RD_KAFKA_OP_ADMIN_RESULT);
+        rd_kafka_TopicDescription_t *topicdesc =
+            rd_calloc(1, sizeof(*topicdesc));
+        int i;
+
+        rko_partial->rko_evtype = RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT;
+        topicdesc->topic        = rd_strdup(topic);
+        topicdesc->authorized_operations_cnt = -1;
+        topicdesc->partitions =
+            rd_calloc(last - first + 1, sizeof(*topicdesc->partitions));
+        for (i = first; i <= last; i++) {
+                rd_kafka_TopicPartitionInfo_t *pinfo =
+                    rd_calloc(1, sizeof(*pinfo));
+                pinfo->partition                                  = i;
+                pinfo->leader_epoch                               = -1;
+                topicdesc->partitions[topicdesc->partition_cnt++] = pinfo;
+        }
+        rd_list_init(&rko_partial->rko_u.admin_result.results, 1,
+                     rd_kafka_TopicDescription_free);
+        rd_list_add(&rko_partial->rko_u.admin_result.results, topicdesc);
+        rd_list_init(&rko_partial->rko_u.admin_result.args, 0, NULL);
+        return rko_partial;
+}
+
+/**
+ * @brief A topic spanning two pages is merged into one description.
+ */
+static int ut_DescribeTopicPartitions_merge(void) {
+        rd_kafka_op_t *rko_fanout = rd_kafka_op_new(RD_KAFKA_OP_ADMIN_FANOUT);
+        rd_kafka_op_t *rko_partial;
+        const rd_kafka_TopicDescription_t *topicdesc;
+        int i;
+
+        RD_UT_SAY("DescribeTopicPartitions: merges a topic across pages");
+
+        rd_list_init(&rko_fanout->rko_u.admin_request.fanout.results, 1,
+                     rd_kafka_TopicDescription_free);
+        rd_list_init(&rko_fanout->rko_u.admin_request.args, 0, rd_free);
+
+        rko_partial = ut_make_DescribeTopicPartitions_partial("orders", 0, 1);
+        rd_kafka_DescribeTopicPartitions_response_merge(rko_fanout,
+                                                        rko_partial);
+        rd_kafka_op_destroy(rko_partial);
+        rko_partial = ut_make_DescribeTopicPartitions_partial("orders", 2, 4);
+        rd_kafka_DescribeTopicPartitions_response_merge(rko_fanout,
+                                                        rko_partial);
+        rd_kafka_op_destroy(rko_partial);
+        rko_partial = ut_make_DescribeTopicPartitions_partial("zeta", 0, 0);
+        rd_kafka_DescribeTopicPartitions_response_merge(rko_fanout,
+                                                        rko_partial);
+        rd_kafka_op_destroy(rko_partial);
+
+        RD_UT_ASSERT(!rko_fanout->rko_error, "unexpected error");
+        RD_UT_ASSERT(
+            rd_list_cnt(&rko_fanout->rko_u.admin_request.fanout.results) == 2,
+            "expected 2 topics, got %d",
+            rd_list_cnt(&rko_fanout->rko_u.admin_request.fanout.results));
+        topicdesc =
+            rd_list_elem(&rko_fanout->rko_u.admin_request.fanout.results, 0);
+        RD_UT_ASSERT(topicdesc->partition_cnt == 5,
+                     "expected 5 partitions, got %d", topicdesc->partition_cnt);
+        for (i = 0; i < topicdesc->partition_cnt; i++)
+                RD_UT_ASSERT(topicdesc->partitions[i]->partition == i,
+                             "expected partition %d at %d", i, i);
+
+        rd_kafka_op_destroy(rko_fanout);
+        RD_UT_PASS();
+}
+
+static int ut_DescribeTopicPartitions(void) {
+        rd_kafka_t *rk         = rd_kafka_new(RD_KAFKA_PRODUCER, NULL, NULL, 0);
+        rd_kafka_q_t *rkq      = rd_kafka_q_new(rk);
+        rd_kafka_broker_t *rkb = rd_kafka_broker_add_logical(rk, "unittest");
+        int fails              = 0;
+
+        fails += ut_DescribeTopicPartitions_parse(rk, rkq, rkb);
+        fails += ut_DescribeTopicPartitions_parse_malformed(rk, rkq, rkb);
+        fails += ut_DescribeTopicPartitions_merge();
+
+        rd_kafka_broker_destroy(rkb); /* add_logical()'s reference */
+        rd_kafka_q_destroy_owner(rkq);
+        rd_kafka_destroy(rk);
+        return fails;
+}
+
+/**@}*/
+
 int unittest_admin(void) {
         int fails = 0;
         fails += ut_ListConsumerGroups_response_merge();
+        fails += ut_DescribeTopicPartitions();
         return fails;
 }
 

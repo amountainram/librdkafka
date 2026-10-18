@@ -182,13 +182,16 @@ typedef enum {
                                                      u.admin_request >*/
         RD_KAFKA_OP_LISTOFFSETS,     /**< Admin: ListOffsets u.admin_request >*/
         RD_KAFKA_OP_METADATA_UPDATE, /**< Metadata update (KIP 951) **/
-        RD_KAFKA_OP_SET_TELEMETRY_BROKER, /**< Set preferred broker for
-                                               telemetry. */
-        RD_KAFKA_OP_TERMINATE_TELEMETRY,  /**< Start termination sequence for
-                                               telemetry. */
-        RD_KAFKA_OP_ELECTLEADERS,         /**< Admin:
-                                           *   ElectLeaders
-                                           *   u.admin_request */
+        RD_KAFKA_OP_SET_TELEMETRY_BROKER,    /**< Set preferred broker for
+                                                  telemetry. */
+        RD_KAFKA_OP_TERMINATE_TELEMETRY,     /**< Start termination sequence for
+                                                  telemetry. */
+        RD_KAFKA_OP_ELECTLEADERS,            /**< Admin:
+                                              *   ElectLeaders
+                                              *   u.admin_request */
+        RD_KAFKA_OP_DESCRIBETOPICPARTITIONS, /**< Admin:
+                                              *   DescribeTopicPartitions
+                                              *   u.admin_request */
         RD_KAFKA_OP_SHARE_FETCH, /**< broker op: Issue share fetch request if
                                     applicable. */
         RD_KAFKA_OP_SHARE_FETCH_FANOUT, /**< fanout share fetch operation */

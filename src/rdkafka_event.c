@@ -99,6 +99,8 @@ const char *rd_kafka_event_name(const rd_kafka_event_t *rkev) {
                 return "ListOffsetsResult";
         case RD_KAFKA_EVENT_ELECTLEADERS_RESULT:
                 return "ElectLeadersResult";
+        case RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT:
+                return "DescribeTopicPartitionsResult";
         default:
                 return "?unknown?";
         }
@@ -499,4 +501,13 @@ rd_kafka_event_ElectLeaders_result(rd_kafka_event_t *rkev) {
                 return NULL;
         else
                 return (const rd_kafka_ElectLeaders_result_t *)rkev;
+}
+
+const rd_kafka_DescribeTopicPartitions_result_t *
+rd_kafka_event_DescribeTopicPartitions_result(rd_kafka_event_t *rkev) {
+        if (!rkev ||
+            rkev->rko_evtype != RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT)
+                return NULL;
+        else
+                return (const rd_kafka_DescribeTopicPartitions_result_t *)rkev;
 }

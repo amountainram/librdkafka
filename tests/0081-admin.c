@@ -3401,6 +3401,137 @@ test_match_authorized_operations(const rd_kafka_AclOperation_t *expected,
  * operations included in topic descriptions, and if they're changed if
  * ACLs are defined.
  */
+/**
+ * @brief Verify DescribeTopicPartitions: named topics, an unknown one,
+ *        and all topics, a partition per response.
+ */
+static void do_test_DescribeTopicPartitions(const char *what,
+                                            rd_kafka_t *rk,
+                                            rd_kafka_queue_t *rkqu,
+                                            int request_timeout) {
+        rd_kafka_queue_t *q;
+        char *topic_names[2];
+        rd_kafka_TopicCollection_t *named, *all;
+        rd_kafka_AdminOptions_t *options;
+        rd_kafka_event_t *rkev;
+        const rd_kafka_DescribeTopicPartitions_result_t *res;
+        const rd_kafka_TopicDescription_t **result_topics;
+        const rd_kafka_TopicPartitionInfo_t **partitions;
+        size_t result_topics_cnt, partitions_cnt, i;
+        const rd_kafka_error_t *error;
+        rd_bool_t found = rd_false;
+        char errstr[128];
+
+        SUB_TEST_QUICK("%s DescribeTopicPartitions with %s, request_timeout %d",
+                       rd_kafka_name(rk), what, request_timeout);
+
+        q = rkqu ? rkqu : rd_kafka_queue_new(rk);
+
+        /* Only the first topic exists */
+        for (i = 0; i < 2; i++)
+                rd_strdupa(&topic_names[i],
+                           test_mk_topic_name(__FUNCTION__, 1));
+        named = rd_kafka_TopicCollection_of_topic_names(
+            (const char **)topic_names, 2);
+        all = rd_kafka_TopicCollection_of_topic_names(NULL, 0);
+
+        test_CreateTopics_simple(rk, NULL, topic_names, 1, 3, NULL);
+        test_wait_topic_exists(rk, topic_names[0], 10000);
+
+        options = rd_kafka_AdminOptions_new(
+            rk, RD_KAFKA_ADMIN_OP_DESCRIBETOPICPARTITIONS);
+        TEST_CALL_ERR__(rd_kafka_AdminOptions_set_request_timeout(
+            options, request_timeout, errstr, sizeof(errstr)));
+        TEST_CALL_ERROR__(
+            rd_kafka_AdminOptions_set_partition_size_limit_per_response(options,
+                                                                        1));
+
+        /* Named topics: in the requested order */
+        rd_kafka_DescribeTopicPartitions(rk, named, options, q);
+        rkev = test_wait_admin_result(
+            q, RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT,
+            tmout_multip(20 * 1000));
+        TEST_ASSERT(!rd_kafka_event_error(rkev), "Expected success, got %s",
+                    rd_kafka_event_error_string(rkev));
+        res           = rd_kafka_event_DescribeTopicPartitions_result(rkev);
+        result_topics = rd_kafka_DescribeTopicPartitions_result_topics(
+            res, &result_topics_cnt);
+        TEST_ASSERT(result_topics_cnt == 2, "Expected 2 topics, got %" PRIusz,
+                    result_topics_cnt);
+
+        TEST_ASSERT(!strcmp(rd_kafka_TopicDescription_name(result_topics[0]),
+                            topic_names[0]),
+                    "Expected topic %s first, got %s", topic_names[0],
+                    rd_kafka_TopicDescription_name(result_topics[0]));
+        TEST_ASSERT(!rd_kafka_TopicDescription_error(result_topics[0]),
+                    "Unexpected error for %s", topic_names[0]);
+        partitions = rd_kafka_TopicDescription_partitions(result_topics[0],
+                                                          &partitions_cnt);
+        TEST_ASSERT(partitions_cnt == 3, "Expected 3 partitions, got %" PRIusz,
+                    partitions_cnt);
+        for (i = 0; i < partitions_cnt; i++) {
+                const rd_kafka_Node_t *leader =
+                    rd_kafka_TopicPartitionInfo_leader(partitions[i]);
+                size_t replica_cnt;
+
+                TEST_ASSERT(rd_kafka_TopicPartitionInfo_partition(
+                                partitions[i]) == (int)i,
+                            "Expected partition %" PRIusz " in order", i);
+                TEST_ASSERT(leader && rd_kafka_Node_host(leader),
+                            "Expected a known leader for partition %" PRIusz,
+                            i);
+                TEST_ASSERT(rd_kafka_TopicPartitionInfo_leader_epoch(
+                                partitions[i]) >= 0,
+                            "Expected a leader epoch for partition %" PRIusz,
+                            i);
+                rd_kafka_TopicPartitionInfo_replicas(partitions[i],
+                                                     &replica_cnt);
+                TEST_ASSERT(replica_cnt == 1,
+                            "Expected 1 replica, got %" PRIusz, replica_cnt);
+        }
+
+        error = rd_kafka_TopicDescription_error(result_topics[1]);
+        TEST_ASSERT(error && rd_kafka_error_code(error) ==
+                                 RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART,
+                    "Expected %s to be unknown, got %s", topic_names[1],
+                    error ? rd_kafka_error_name(error) : "no error");
+        rd_kafka_event_destroy(rkev);
+
+        /* All topics: the created one, whole */
+        rd_kafka_DescribeTopicPartitions(rk, all, options, q);
+        rkev = test_wait_admin_result(
+            q, RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT,
+            tmout_multip(20 * 1000));
+        TEST_ASSERT(!rd_kafka_event_error(rkev), "Expected success, got %s",
+                    rd_kafka_event_error_string(rkev));
+        res           = rd_kafka_event_DescribeTopicPartitions_result(rkev);
+        result_topics = rd_kafka_DescribeTopicPartitions_result_topics(
+            res, &result_topics_cnt);
+        for (i = 0; i < result_topics_cnt; i++) {
+                if (strcmp(rd_kafka_TopicDescription_name(result_topics[i]),
+                           topic_names[0]))
+                        continue;
+                found = rd_true;
+                rd_kafka_TopicDescription_partitions(result_topics[i],
+                                                     &partitions_cnt);
+                TEST_ASSERT(partitions_cnt == 3,
+                            "Expected 3 partitions, got %" PRIusz,
+                            partitions_cnt);
+        }
+        TEST_ASSERT(found, "Expected %s among all topics", topic_names[0]);
+        rd_kafka_event_destroy(rkev);
+
+        test_DeleteTopics_simple(rk, NULL, topic_names, 1, NULL);
+
+        rd_kafka_AdminOptions_destroy(options);
+        rd_kafka_TopicCollection_destroy(named);
+        rd_kafka_TopicCollection_destroy(all);
+        if (!rkqu)
+                rd_kafka_queue_destroy(q);
+
+        SUB_TEST_PASS();
+}
+
 static void do_test_DescribeTopics(const char *what,
                                    rd_kafka_t *rk,
                                    rd_kafka_queue_t *rkqu,
@@ -5531,6 +5662,12 @@ static void do_test_apis(rd_kafka_type_t cltype) {
         /* Describe topics */
         do_test_DescribeTopics("temp queue", rk, NULL, 15000, rd_false);
         do_test_DescribeTopics("main queue", rk, mainq, 15000, rd_false);
+
+        if (test_broker_version >= TEST_BRKVER(3, 8, 0, 0)) {
+                /* Describe topics and their partitions (KIP-966) */
+                do_test_DescribeTopicPartitions("temp queue", rk, NULL, 15000);
+                do_test_DescribeTopicPartitions("main queue", rk, mainq, 15000);
+        }
 
         /* Describe cluster */
         do_test_DescribeCluster("temp queue", rk, NULL, 1500, rd_false);

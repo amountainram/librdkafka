@@ -904,6 +904,128 @@ static void do_test_DescribeTopics(const char *what,
         SUB_TEST_PASS();
 }
 
+static void do_test_DescribeTopicPartitions(const char *what,
+                                            rd_kafka_t *rk,
+                                            rd_kafka_queue_t *useq,
+                                            int with_options) {
+        rd_kafka_queue_t *q;
+#define TEST_DESCRIBE_TOPIC_PARTITIONS_CNT 4
+        const char *topic_names[TEST_DESCRIBE_TOPIC_PARTITIONS_CNT];
+        rd_kafka_TopicCollection_t *topics;
+        rd_kafka_AdminOptions_t *options = NULL;
+        int exp_timeout                  = MY_SOCKET_TIMEOUT_MS;
+        int i;
+        char errstr[512];
+        const char *errstr2;
+        rd_kafka_resp_err_t err;
+        rd_kafka_error_t *error;
+        test_timing_t timing;
+        rd_kafka_event_t *rkev;
+        const rd_kafka_DescribeTopicPartitions_result_t *res;
+        const rd_kafka_TopicDescription_t **restopics;
+        size_t restopic_cnt;
+        void *my_opaque = NULL, *opaque;
+
+        SUB_TEST_QUICK("%s DescribeTopicPartitions with %s, timeout %dms",
+                       rd_kafka_name(rk), what, exp_timeout);
+
+        q = useq ? useq : rd_kafka_queue_new(rk);
+
+        for (i = 0; i < TEST_DESCRIBE_TOPIC_PARTITIONS_CNT; i++) {
+                topic_names[i] = rd_strdup(test_mk_topic_name(__FUNCTION__, 1));
+        }
+
+        topics = rd_kafka_TopicCollection_of_topic_names(
+            topic_names, TEST_DESCRIBE_TOPIC_PARTITIONS_CNT);
+
+        if (with_options) {
+                options = rd_kafka_AdminOptions_new(
+                    rk, RD_KAFKA_ADMIN_OP_DESCRIBETOPICPARTITIONS);
+
+                exp_timeout = MY_SOCKET_TIMEOUT_MS * 2;
+                err         = rd_kafka_AdminOptions_set_request_timeout(
+                    options, exp_timeout, errstr, sizeof(errstr));
+                TEST_ASSERT(!err, "%s", rd_kafka_err2str(err));
+                if ((error =
+                         rd_kafka_AdminOptions_set_include_authorized_operations(
+                             options, 0))) {
+                        fprintf(stderr,
+                                "%% Failed to set topic authorized operations: "
+                                "%s\n",
+                                rd_kafka_error_string(error));
+                        rd_kafka_error_destroy(error);
+                        TEST_FAIL(
+                            "Failed to set topic authorized operations\n");
+                }
+                if ((error =
+                         rd_kafka_AdminOptions_set_partition_size_limit_per_response(
+                             options, 1))) {
+                        TEST_FAIL("Failed to set partition limit: %s",
+                                  rd_kafka_error_string(error));
+                }
+
+                if (useq) {
+                        my_opaque = (void *)456;
+                        rd_kafka_AdminOptions_set_opaque(options, my_opaque);
+                }
+        }
+
+        TIMING_START(&timing, "DescribeTopicPartitions");
+        TEST_SAY("Call DescribeTopicPartitions, timeout is %dms\n",
+                 exp_timeout);
+        rd_kafka_DescribeTopicPartitions(rk, topics, options, q);
+        TIMING_ASSERT_LATER(&timing, 0, 50);
+
+        /* Poll result queue */
+        TIMING_START(&timing, "DescribeTopicPartitions.queue_poll");
+        rkev = rd_kafka_queue_poll(q, exp_timeout + 1000);
+        TIMING_ASSERT_LATER(&timing, exp_timeout - 100, exp_timeout + 100);
+        TEST_ASSERT(rkev != NULL, "expected result in %dms", exp_timeout);
+        TEST_SAY("DescribeTopicPartitions: got %s in %.3fs\n",
+                 rd_kafka_event_name(rkev), TIMING_DURATION(&timing) / 1000.0f);
+
+        /* Convert event to proper result */
+        res = rd_kafka_event_DescribeTopicPartitions_result(rkev);
+        TEST_ASSERT(res, "expected DescribeTopicPartitions_result, not %s",
+                    rd_kafka_event_name(rkev));
+
+        opaque = rd_kafka_event_opaque(rkev);
+        TEST_ASSERT(opaque == my_opaque, "expected opaque to be %p, not %p",
+                    my_opaque, opaque);
+
+        /* Expecting error (Fail while waiting for controller)*/
+        err     = rd_kafka_event_error(rkev);
+        errstr2 = rd_kafka_event_error_string(rkev);
+        TEST_ASSERT(
+            err == RD_KAFKA_RESP_ERR__TIMED_OUT,
+            "expected DescribeTopicPartitions to return error %s, not %s (%s)",
+            rd_kafka_err2str(RD_KAFKA_RESP_ERR__TIMED_OUT),
+            rd_kafka_err2str(err), err ? errstr2 : "n/a");
+
+        /* Extract topics, should return 0 topics. */
+        restopics =
+            rd_kafka_DescribeTopicPartitions_result_topics(res, &restopic_cnt);
+        TEST_ASSERT(!restopics && restopic_cnt == 0,
+                    "expected no result topics, got %p cnt %" PRIusz, restopics,
+                    restopic_cnt);
+
+        rd_kafka_event_destroy(rkev);
+
+        for (i = 0; i < TEST_DESCRIBE_TOPIC_PARTITIONS_CNT; i++) {
+                rd_free((char *)topic_names[i]);
+        }
+        rd_kafka_TopicCollection_destroy(topics);
+
+        if (options)
+                rd_kafka_AdminOptions_destroy(options);
+
+        if (!useq)
+                rd_kafka_queue_destroy(q);
+#undef TEST_DESCRIBE_TOPIC_PARTITIONS_CNT
+
+        SUB_TEST_PASS();
+}
+
 /**
  * @brief DescribeCluster tests
  *
@@ -2770,11 +2892,12 @@ static void do_test_options(rd_kafka_t *rk) {
                     RD_KAFKA_ADMIN_OP_ALTERCONSUMERGROUPOFFSETS,               \
                     RD_KAFKA_ADMIN_OP_DELETECONSUMERGROUPOFFSETS,              \
                     RD_KAFKA_ADMIN_OP_ELECTLEADERS,                            \
+                    RD_KAFKA_ADMIN_OP_DESCRIBETOPICPARTITIONS,                 \
                     RD_KAFKA_ADMIN_OP_ANY /* Must be last */                   \
         }
         struct {
                 const char *setter;
-                const rd_kafka_admin_op_t valid_apis[17];
+                const rd_kafka_admin_op_t valid_apis[18];
         } matrix[] = {
             {"request_timeout", _all_apis},
             {"operation_timeout",
@@ -2790,6 +2913,8 @@ static void do_test_options(rd_kafka_t *rk) {
              {RD_KAFKA_ADMIN_OP_LISTCONSUMERGROUPOFFSETS}},
             {"match_consumer_group_states",
              {RD_KAFKA_ADMIN_OP_LISTCONSUMERGROUPS}},
+            {"partition_size_limit_per_response",
+             {RD_KAFKA_ADMIN_OP_DESCRIBETOPICPARTITIONS}},
             {"opaque", _all_apis},
             {NULL},
         };
@@ -2839,6 +2964,11 @@ static void do_test_options(rd_kafka_t *rk) {
                                 error =
                                     rd_kafka_AdminOptions_set_match_consumer_group_states(
                                         options, state, 1);
+                        else if (!strcmp(matrix[i].setter,
+                                         "partition_size_limit_per_response"))
+                                error =
+                                    rd_kafka_AdminOptions_set_partition_size_limit_per_response(
+                                        options, 100);
                         else if (!strcmp(matrix[i].setter, "opaque")) {
                                 rd_kafka_AdminOptions_set_opaque(
                                     options, (void *)options);
@@ -2976,6 +3106,10 @@ static void do_test_apis(rd_kafka_type_t cltype) {
         do_test_DescribeTopics("temp queue, no options", rk, NULL, 0);
         do_test_DescribeTopics("temp queue, options", rk, NULL, 1);
         do_test_DescribeTopics("main queue, options", rk, mainq, 1);
+
+        do_test_DescribeTopicPartitions("temp queue, no options", rk, NULL, 0);
+        do_test_DescribeTopicPartitions("temp queue, options", rk, NULL, 1);
+        do_test_DescribeTopicPartitions("main queue, options", rk, mainq, 1);
 
         do_test_DescribeCluster("temp queue, no options", rk, NULL, 0);
         do_test_DescribeCluster("temp queue, options", rk, NULL, 1);

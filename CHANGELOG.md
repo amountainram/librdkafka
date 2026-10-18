@@ -1,5 +1,18 @@
 # librdkafka v2.x.x (Unreleased)
 
+## Enhancements
+
+* [KIP-966](https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas)
+  AdminAPI: `rd_kafka_DescribeTopicPartitions()` describes the given
+  topics, or all of them, with the DescribeTopicPartitions API (broker
+  3.8.0+) instead of a Metadata request. The broker answers in pages of at
+  most `rd_kafka_AdminOptions_set_partition_size_limit_per_response()`
+  partitions (2000 by default): librdkafka requests the following ones and
+  returns every topic at once. Partitions also report their leader epoch,
+  eligible leader replicas, last known eligible leader replicas, and offline
+  replicas, through new `rd_kafka_TopicPartitionInfo_*()` accessors.
+
+
 ## Fixes
 
 ### General fixes

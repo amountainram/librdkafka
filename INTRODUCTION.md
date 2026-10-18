@@ -2624,6 +2624,7 @@ The [Apache Kafka Implementation Proposals (KIPs)](https://cwiki.apache.org/conf
 | KIP-848 - The Next Generation of the Consumer Rebalance Protocol         | 4.0.0                       | Supported                                                                                     |
 | KIP-899 - Allow producer and consumer clients to rebootstrap             | 3.8.0                       | Supported                                                                                     |
 | KIP-951 - Leader discovery optimisations for the client                  | 3.7.0                       | Supported                                                                                     |
+| KIP-966 - Eligible Leader Replicas                                       | 3.8.0                       | Partially Supported (AdminAPI: DescribeTopicPartitions)                                       |
 | KIP-1082 - Require Client-Generated IDs over the ConsumerGroupHeartbeat  | 4.0.0                       | Supported                                                                                     |
 | KIP-1102 - Enable clients to rebootstrap based on timeout or error code  | 4.0.0                       | Supported                                                                                     |
 | KIP-1139 - Add support for OAuth jwt-bearer grant type                   | 4.1.0 (WIP)                 | Supported                                                                                     |
@@ -2683,6 +2684,7 @@ release of librdkafka.
 | 69     | ConsumerGroupDescribe        | 1         | 0              |
 | 71     | GetTelemetrySubscriptions    | 0         | 0              |
 | 72     | PushTelemetry                | 0         | 0              |
+| 75     | DescribeTopicPartitions      | 0         | 0              |
 
 <a name="recommendations-for-language-binding-developers"></a>
 # Recommendations for language binding developers
