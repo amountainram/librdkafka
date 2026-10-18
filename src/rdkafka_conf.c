@@ -222,7 +222,7 @@ struct rd_kafka_property {
 #define _UNSUPPORTED_WIN32_GSSAPI .unsupported = NULL
 #endif
 
-#if defined(_WIN32) || defined(WITH_SASL_CYRUS)
+#if defined(_WIN32) || WITH_SASL_CYRUS
 #define _UNSUPPORTED_GSSAPI .unsupported = NULL
 #else
 #define _UNSUPPORTED_GSSAPI                                                    \
