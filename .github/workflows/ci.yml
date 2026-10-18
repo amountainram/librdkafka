@@ -1,0 +1,188 @@
+# CI for this fork, on GitHub's runners: what upstream runs on Semaphore
+# (.semaphore/) and promotes to its broker test pipelines (run-all-tests,
+# run-asan-tests), with the Kafka brokers in Docker instead of trivup's
+# (.github/ci/kafka/).
+#
+#   every push and pull request   style, builds (-Werror), broker-less tests,
+#                                 the same under AddressSanitizer
+#   pushes to master, PRs         + the quick broker test suite
+#   weekly, or by hand            + the full broker test suite, or the tests
+#                                 and Kafka version chosen
+
+name: CI
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+  schedule:
+    # Mondays, 03:00 UTC: the full broker test suite
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      broker-suite:
+        description: Broker test suite
+        type: choice
+        options: [quick, full]
+        default: quick
+      tests:
+        description: >-
+          Broker tests to run, as TESTS of tests/run-test-batches.py (e.g. 81 or 80-90), all if empty
+        default: ""
+      kafka-version:
+        description: Apache Kafka version (the apache/kafka image)
+        default: "4.3.0"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # every master build runs to the end
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
+
+env:
+  KAFKA_VERSION: ${{ inputs.kafka-version || '4.3.0' }}
+
+jobs:
+  style:
+    name: Style check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install clang-format 18, flake8 and autopep8
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-18
+          python3 -m pip install flake8 autopep8
+      - name: make style-check
+        run: make style-check
+        env:
+          CLANG_FORMAT: clang-format-18
+
+  build:
+    name: Build and broker-less tests (${{ matrix.cc }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # -Werror as upstream's Linux builds, with gcc: upstream code has
+        # warnings clang reports (as on its macOS builds, without -Werror)
+        include:
+          - cc: gcc
+            cxx: g++
+            configure: --enable-werror
+          - cc: clang
+            cxx: clang++
+            configure: ""
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: ./configure --install-deps --enable-devel ${{ matrix.configure }}
+      - name: Build
+        run: |
+          make -j"$(nproc)" all examples check
+          examples/rdkafka_example -X builtin.features
+          make -j"$(nproc)" -C tests build
+      - name: Broker-less tests (unit and mock), retried once
+        # some mock tests are timing sensitive when run in parallel, e.g.
+        # 0146_metadata_mock: a failure gets a second run
+        run: make -C tests run_local_quick || make -C tests run_local_quick
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-less-tests-${{ matrix.cc }}
+          path: |
+            tests/*.log
+            tests/test_report_*.json
+          if-no-files-found: ignore
+
+  cmake:
+    name: CMake build and unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libsasl2-dev libzstd-dev \
+            liblz4-dev zlib1g-dev libcurl4-openssl-dev
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DRDKAFKA_BUILD_EXAMPLES=ON -DRDKAFKA_BUILD_TESTS=ON
+          cmake --build build -j"$(nproc)"
+      - name: Unit tests
+        working-directory: tests
+        run: TESTS=0000 ../build/tests/test-runner -l
+
+  asan:
+    name: Broker-less tests under AddressSanitizer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libsasl2-dev libzstd-dev \
+            liblz4-dev zlib1g-dev libcurl4-openssl-dev
+      - name: Build with AddressSanitizer
+        run: ./dev-conf.sh asan
+      - name: Broker-less tests (unit and mock), retried once
+        run: make -C tests run_local_quick || make -C tests run_local_quick
+        env:
+          ASAN_OPTIONS: print_stacktrace=1:symbolize=1:detect_leaks=1
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-less-tests-asan
+          path: |
+            tests/*.log
+            tests/test_report_*.json
+          if-no-files-found: ignore
+
+  kafka:
+    name: Broker tests (Apache Kafka ${{ inputs.kafka-version || '4.3.0' }}, ${{ (github.event_name == 'schedule' && 'full') || inputs.broker-suite || 'quick' }})
+    # on pushes, master only: the suite takes a while
+    if: github.event_name != 'push' || github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      TESTS: ${{ inputs.tests }}
+      SUITE: ${{ (github.event_name == 'schedule' && 'full') || inputs.broker-suite || 'quick' }}
+    steps:
+      - uses: actions/checkout@v7
+      # Kafka's scripts and Java tests, in tests/, run on the host
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Configure
+        run: ./configure --install-deps --enable-devel
+      - name: Build
+        run: |
+          make -j"$(nproc)" all
+          make -j"$(nproc)" -C tests build
+      - name: Broker tests
+        run: |
+          args=()
+          if [ "$SUITE" = quick ]; then args+=(-Q); fi
+          .github/ci/kafka/run-tests.sh "${args[@]}"
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-tests
+          path: |
+            tests/*.log
+            tests/test_report_*.json
+          if-no-files-found: ignore

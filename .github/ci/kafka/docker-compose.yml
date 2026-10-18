@@ -1,0 +1,84 @@
+# A 3-broker KRaft Kafka cluster for librdkafka's broker tests, configured as
+# trivup configures the cluster of tests/run-all-tests.sh: rack per broker,
+# 4 partitions and 3 replicas per topic, the StandardAuthorizer with
+# allow.everyone.if.no.acl.found, brokers talking to each other as the super
+# user admin over SASL/PLAIN, clients as ANONYMOUS over PLAINTEXT.
+#
+# Host networking, so brokers advertise localhost as the tests reach them:
+#
+#   broker  clients (PLAINTEXT)  inter-broker  controller
+#   1       localhost:9092       9192          9292
+#   2       localhost:9093       9193          9293
+#   3       localhost:9094       9194          9294
+#
+# Started by run-tests.sh, next to this file.
+name: librdkafka-tests
+
+x-kafka: &kafka
+  image: docker.io/apache/kafka:${KAFKA_VERSION:-4.3.0}
+  network_mode: host
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:$${CLIENT_PORT} --list"]
+    start_period: 10s
+    interval: 2s
+    timeout: 20s
+    retries: 60
+
+x-kafka-env: &kafka-env
+  CLUSTER_ID: bGlicmRrYWZrYS10ZXN0cw
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9292,2@localhost:9293,3@localhost:9294
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,BROKER:SASL_PLAINTEXT,CONTROLLER:SASL_PLAINTEXT
+  KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+  KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+  KAFKA_SASL_MECHANISM_CONTROLLER_PROTOCOL: PLAIN
+  KAFKA_LISTENER_NAME_BROKER_PLAIN_SASL_JAAS_CONFIG: >-
+    org.apache.kafka.common.security.plain.PlainLoginModule required
+    username="admin" password="admin" user_admin="admin";
+  KAFKA_LISTENER_NAME_CONTROLLER_PLAIN_SASL_JAAS_CONFIG: >-
+    org.apache.kafka.common.security.plain.PlainLoginModule required
+    username="admin" password="admin" user_admin="admin";
+  KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+  KAFKA_SUPER_USERS: User:admin
+  KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+  KAFKA_DELETE_TOPIC_ENABLE: "true"
+  KAFKA_NUM_PARTITIONS: 4
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  # as tests/run-all-tests.sh configures it
+  KAFKA_GROUP_SHARE_MIN_RECORD_LOCK_DURATION_MS: 1000
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+services:
+  kafka-1:
+    <<: *kafka
+    environment:
+      <<: *kafka-env
+      CLIENT_PORT: 9092
+      KAFKA_NODE_ID: 1
+      KAFKA_BROKER_RACK: RACK1
+      KAFKA_LISTENERS: PLAINTEXT://:9092,BROKER://:9192,CONTROLLER://:9292
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,BROKER://localhost:9192
+
+  kafka-2:
+    <<: *kafka
+    environment:
+      <<: *kafka-env
+      CLIENT_PORT: 9093
+      KAFKA_NODE_ID: 2
+      KAFKA_BROKER_RACK: RACK2
+      KAFKA_LISTENERS: PLAINTEXT://:9093,BROKER://:9193,CONTROLLER://:9293
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9093,BROKER://localhost:9193
+
+  kafka-3:
+    <<: *kafka
+    environment:
+      <<: *kafka-env
+      CLIENT_PORT: 9094
+      KAFKA_NODE_ID: 3
+      KAFKA_BROKER_RACK: RACK3
+      KAFKA_LISTENERS: PLAINTEXT://:9094,BROKER://:9194,CONTROLLER://:9294
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9094,BROKER://localhost:9194
