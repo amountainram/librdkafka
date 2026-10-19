@@ -592,7 +592,8 @@ static void do_test_share_group_error_injection(void) {
 static void do_test_share_group_rtt_injection(void) {
         rd_kafka_mock_cluster_t *mcluster;
         const char *bootstraps;
-        rd_kafka_topic_partition_list_t *subscription, *assignment;
+        rd_kafka_topic_partition_list_t *subscription;
+        int cnt;
         rd_kafka_share_t *share_c;
         rd_kafka_conf_t *conf;
         char errstr[512];
@@ -627,14 +628,9 @@ static void do_test_share_group_rtt_injection(void) {
 
         /* Wait for initial join and assignment */
         wait_share_heartbeats(mcluster, 1, 500);
-        rd_usleep(500 * 1000, 0);
-
         /* Verify initial assignment */
-        TEST_CALL_ERR__(rd_kafka_assignment(test_share_consumer_get_rk(share_c),
-                                            &assignment));
-        TEST_ASSERT(assignment->cnt == 3,
-                    "Expected 3 partitions initially, got %d", assignment->cnt);
-        rd_kafka_topic_partition_list_destroy(assignment);
+        cnt = wait_assignment_count(share_c, 3, 10000);
+        TEST_ASSERT(cnt == 3, "Expected 3 partitions initially, got %d", cnt);
 
         /* Inject RTT larger than socket.timeout.ms to cause a real timeout.
          * The Java test verifies TimeoutException + backoff retry. */
@@ -651,16 +647,11 @@ static void do_test_share_group_rtt_injection(void) {
                     "Expected heartbeats to resume after timeout, got %d",
                     found_heartbeats);
 
-        /* Wait for assignment to be restored */
-        rd_usleep(500 * 1000, 0);
-
-        /* Verify consumer recovered and still has assignment */
-        TEST_CALL_ERR__(rd_kafka_assignment(test_share_consumer_get_rk(share_c),
-                                            &assignment));
-        TEST_ASSERT(assignment->cnt == 3,
+        /* Wait for the consumer to recover its assignment */
+        cnt = wait_assignment_count(share_c, 3, 10000);
+        TEST_ASSERT(cnt == 3,
                     "Expected 3 partitions after timeout recovery, got %d",
-                    assignment->cnt);
-        rd_kafka_topic_partition_list_destroy(assignment);
+                    cnt);
 
         /* Cleanup */
         test_share_consumer_close(share_c);
@@ -1403,7 +1394,8 @@ static void do_test_group_max_size_reached_error(void) {
 static void do_test_member_rejoin_with_epoch_zero(void) {
         rd_kafka_mock_cluster_t *mcluster;
         const char *bootstraps;
-        rd_kafka_topic_partition_list_t *subscription, *assignment;
+        rd_kafka_topic_partition_list_t *subscription;
+        int cnt;
         rd_kafka_share_t *share_c;
         int found_heartbeats;
         const char *topic = test_mk_topic_name(__FUNCTION__, 0);
@@ -1427,14 +1419,9 @@ static void do_test_member_rejoin_with_epoch_zero(void) {
 
         /* Wait for initial join and assignment */
         wait_share_heartbeats(mcluster, 1, 1000);
-        rd_usleep(500 * 1000, 0);
-
         /* Verify initial assignment (member is now in stable state) */
-        TEST_CALL_ERR__(rd_kafka_assignment(test_share_consumer_get_rk(share_c),
-                                            &assignment));
-        TEST_ASSERT(assignment->cnt == 3,
-                    "Expected 3 partitions initially, got %d", assignment->cnt);
-        rd_kafka_topic_partition_list_destroy(assignment);
+        cnt = wait_assignment_count(share_c, 3, 10000);
+        TEST_ASSERT(cnt == 3, "Expected 3 partitions initially, got %d", cnt);
 
         /* Force a rejoin by injecting UNKNOWN_MEMBER_ID error
          * This will cause client to rejoin with epoch=0 */
@@ -2015,7 +2002,8 @@ static void do_test_group_id_not_found_while_unsubscribed(void) {
 static void do_test_group_id_not_found_while_stable_is_fatal(void) {
         rd_kafka_mock_cluster_t *mcluster;
         const char *bootstraps;
-        rd_kafka_topic_partition_list_t *subscription, *assignment;
+        rd_kafka_topic_partition_list_t *subscription;
+        int cnt;
         rd_kafka_share_t *share_c;
         rd_kafka_error_t *error;
         const char *topic = test_mk_topic_name(__FUNCTION__, 0);
@@ -2039,14 +2027,9 @@ static void do_test_group_id_not_found_while_stable_is_fatal(void) {
 
         /* Wait for initial join and assignment */
         wait_share_heartbeats(mcluster, 1, 1000);
-        rd_usleep(500 * 1000, 0);
-
         /* Verify initial assignment - member is in stable state */
-        TEST_CALL_ERR__(rd_kafka_assignment(test_share_consumer_get_rk(share_c),
-                                            &assignment));
-        TEST_ASSERT(assignment->cnt == 3,
-                    "Expected 3 partitions initially, got %d", assignment->cnt);
-        rd_kafka_topic_partition_list_destroy(assignment);
+        cnt = wait_assignment_count(share_c, 3, 10000);
+        TEST_ASSERT(cnt == 3, "Expected 3 partitions initially, got %d", cnt);
 
         /* Inject GROUP_ID_NOT_FOUND for an active/stable member.
          * This should be treated as fatal (group unexpectedly deleted). */
@@ -2283,7 +2266,8 @@ static void do_test_coordinator_load_in_progress_error(void) {
 static void do_test_graceful_shutdown_stable_state(void) {
         rd_kafka_mock_cluster_t *mcluster;
         const char *bootstraps;
-        rd_kafka_topic_partition_list_t *subscription, *assignment;
+        rd_kafka_topic_partition_list_t *subscription;
+        int cnt;
         rd_kafka_share_t *share_c;
         rd_kafka_error_t *error;
         int found_heartbeats;
@@ -2308,14 +2292,9 @@ static void do_test_graceful_shutdown_stable_state(void) {
 
         /* Wait for initial join and assignment */
         wait_share_heartbeats(mcluster, 1, 1000);
-        rd_usleep(500 * 1000, 0);
-
         /* Verify initial assignment - member is in stable state */
-        TEST_CALL_ERR__(rd_kafka_assignment(test_share_consumer_get_rk(share_c),
-                                            &assignment));
-        TEST_ASSERT(assignment->cnt == 3,
-                    "Expected 3 partitions initially, got %d", assignment->cnt);
-        rd_kafka_topic_partition_list_destroy(assignment);
+        cnt = wait_assignment_count(share_c, 3, 10000);
+        TEST_ASSERT(cnt == 3, "Expected 3 partitions initially, got %d", cnt);
 
         /* Record heartbeat count before close */
         found_heartbeats = wait_share_heartbeats(mcluster, 1, 1000);
@@ -2348,7 +2327,8 @@ static void do_test_graceful_shutdown_stable_state(void) {
 static void do_test_resubscribe_after_unsubscribe(void) {
         rd_kafka_mock_cluster_t *mcluster;
         const char *bootstraps;
-        rd_kafka_topic_partition_list_t *subscription, *assignment;
+        rd_kafka_topic_partition_list_t *subscription;
+        int cnt;
         rd_kafka_share_t *share_c;
         const char *topic = test_mk_topic_name(__FUNCTION__, 0);
         const char *group = "test-share-group-resubscribe";
@@ -2370,27 +2350,17 @@ static void do_test_resubscribe_after_unsubscribe(void) {
         /* First subscribe */
         TEST_CALL_ERR__(rd_kafka_share_subscribe(share_c, subscription));
         wait_share_heartbeats(mcluster, 1, 1000);
-        rd_usleep(500 * 1000, 0);
-
-        TEST_CALL_ERR__(rd_kafka_assignment(test_share_consumer_get_rk(share_c),
-                                            &assignment));
-        TEST_ASSERT(assignment->cnt == 3,
-                    "Expected 3 partitions on first subscribe, got %d",
-                    assignment->cnt);
-        rd_kafka_topic_partition_list_destroy(assignment);
+        cnt = wait_assignment_count(share_c, 3, 10000);
+        TEST_ASSERT(cnt == 3,
+                    "Expected 3 partitions on first subscribe, got %d", cnt);
 
         /* Unsubscribe */
         TEST_SAY("Unsubscribing...\n");
         TEST_CALL_ERR__(rd_kafka_share_unsubscribe(share_c));
-        rd_usleep(500 * 1000, 0);
-
         /* Verify no assignment after unsubscribe */
-        TEST_CALL_ERR__(rd_kafka_assignment(test_share_consumer_get_rk(share_c),
-                                            &assignment));
-        TEST_ASSERT(assignment->cnt == 0,
-                    "Expected 0 partitions after unsubscribe, got %d",
-                    assignment->cnt);
-        rd_kafka_topic_partition_list_destroy(assignment);
+        cnt = wait_assignment_count(share_c, 0, 10000);
+        TEST_ASSERT(cnt == 0, "Expected 0 partitions after unsubscribe, got %d",
+                    cnt);
 
         /* Resubscribe */
         TEST_SAY("Resubscribing...\n");
@@ -2574,7 +2544,8 @@ static void do_test_empty_topic_subscription(void) {
         const char *topic    = test_mk_topic_name(__FUNCTION__, 1);
         const char *group_id = topic;
         rd_kafka_share_t *share_c;
-        rd_kafka_topic_partition_list_t *subscription, *assignment;
+        rd_kafka_topic_partition_list_t *subscription;
+        int cnt;
 
         SUB_TEST_QUICK();
 
@@ -2592,16 +2563,11 @@ static void do_test_empty_topic_subscription(void) {
         wait_share_heartbeats(mcluster, 3, 1000);
 
         /* Wait for assignment on empty topic */
-        rd_usleep(500 * 1000, 0);
-
-        TEST_CALL_ERR__(rd_kafka_assignment(test_share_consumer_get_rk(share_c),
-                                            &assignment));
-        TEST_SAY("Empty topic: %d partitions\n", assignment->cnt);
-        TEST_ASSERT(assignment->cnt == 3, "Expected 3 partitions, got %d",
-                    assignment->cnt);
+        cnt = wait_assignment_count(share_c, 3, 10000);
+        TEST_SAY("Empty topic: %d partitions\n", cnt);
+        TEST_ASSERT(cnt == 3, "Expected 3 partitions, got %d", cnt);
 
         rd_kafka_topic_partition_list_destroy(subscription);
-        rd_kafka_topic_partition_list_destroy(assignment);
         test_share_consumer_close(share_c);
         test_share_destroy(share_c);
 
