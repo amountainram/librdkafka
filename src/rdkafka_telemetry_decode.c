@@ -563,8 +563,9 @@ int unit_test_telemetry(rd_kafka_type_t rk_type,
         rk->rk_telemetry.matched_metrics[0] = metric_name;
         rk->rk_telemetry.rk_historic_c.ts_start =
             (rd_uclock() - 1000 * 1000) * 1000;
-        rk->rk_telemetry.rk_historic_c.ts_last =
-            (rd_uclock() - 1000 * 1000) * 1000;
+        /* "Now", so rate metrics report the raw delta instead of dividing
+         * by a wall-clock interval that depends on how fast this runs. */
+        rk->rk_telemetry.rk_historic_c.ts_last = rd_uclock() * 1000;
 
         rd_avg_init(&rk->rk_telemetry.rd_avg_current.rk_avg_poll_idle_ratio,
                     RD_AVG_GAUGE, 0, 500 * 1000, 2, rd_true);
