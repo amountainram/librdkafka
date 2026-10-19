@@ -21,6 +21,13 @@
   padding, i.e. a payload length multiple of 4, its JSON parsing read past
   the end of the heap buffer.
 
+* OAUTHBEARER OIDC: fix ES256 JWT assertions for the `jwt-bearer` grant
+  type. The signature was sent DER-encoded instead of the 64-byte `R || S`
+  form required by RFC 7518, so compliant identity providers rejected it.
+  A private key whose type does not match
+  `sasl.oauthbearer.assertion.algorithm` is now reported as an error
+  instead of producing an invalid assertion.
+
 ### Admin fixes
 
 * Fix a crash in `ListConsumerGroupOffsets` when a coordinator error is returned

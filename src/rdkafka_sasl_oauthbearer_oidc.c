@@ -40,6 +40,8 @@
 #include "rdhttp.h"
 #include "rdkafka_sasl_oauthbearer_oidc.h"
 #include "rdbase64.h"
+#include <openssl/bn.h>
+#include <openssl/ec.h>
 
 
 /**
@@ -387,6 +389,7 @@ static char *rd_kafka_oidc_assertion_create(
         cJSON *payload_json_obj = NULL;
         EVP_MD_CTX *mdctx       = NULL;
         unsigned char *sig      = NULL;
+        unsigned char es256_sig[64];
         rd_chariov_t header_iov;
         rd_chariov_t payload_iov;
         rd_chariov_t sig_iov;
@@ -509,6 +512,20 @@ static char *rd_kafka_oidc_assertion_create(
                 goto cleanup;
         }
 
+        if (token_signing_algo ==
+            RD_KAFKA_SASL_OAUTHBEARER_ASSERTION_ALGORITHM_ES256) {
+                if (EVP_PKEY_base_id(pkey) != EVP_PKEY_EC ||
+                    EVP_PKEY_bits(pkey) != 256) {
+                        rd_kafka_log(rk, LOG_ERR, "JWT",
+                                     "ES256 requires a P-256 EC private key");
+                        goto cleanup;
+                }
+        } else if (EVP_PKEY_base_id(pkey) != EVP_PKEY_RSA) {
+                rd_kafka_log(rk, LOG_ERR, "JWT",
+                             "RS256 requires an RSA private key");
+                goto cleanup;
+        }
+
         mdctx = EVP_MD_CTX_new();
         if (!mdctx) {
                 rd_kafka_log(rk, LOG_ERR, "JWT",
@@ -550,8 +567,36 @@ static char *rd_kafka_oidc_assertion_create(
                 goto cleanup;
         }
 
-        sig_iov.ptr       = (char *)sig;
-        sig_iov.size      = siglen;
+        if (token_signing_algo ==
+            RD_KAFKA_SASL_OAUTHBEARER_ASSERTION_ALGORITHM_ES256) {
+                /* JWS (RFC 7518 section 3.4) requires the fixed-size
+                 * R || S form, OpenSSL returns a DER ECDSA-Sig-Value. */
+                const unsigned char *der = sig;
+                const BIGNUM *r, *s;
+                ECDSA_SIG *ecdsa_sig = d2i_ECDSA_SIG(NULL, &der, (long)siglen);
+
+                if (!ecdsa_sig) {
+                        rd_kafka_log(rk, LOG_ERR, "JWT",
+                                     "Failed to decode ES256 signature");
+                        goto cleanup;
+                }
+
+                ECDSA_SIG_get0(ecdsa_sig, &r, &s);
+                if (BN_bn2binpad(r, es256_sig, 32) != 32 ||
+                    BN_bn2binpad(s, es256_sig + 32, 32) != 32) {
+                        ECDSA_SIG_free(ecdsa_sig);
+                        rd_kafka_log(rk, LOG_ERR, "JWT",
+                                     "Failed to encode ES256 signature");
+                        goto cleanup;
+                }
+                ECDSA_SIG_free(ecdsa_sig);
+
+                sig_iov.ptr  = (char *)es256_sig;
+                sig_iov.size = sizeof(es256_sig);
+        } else {
+                sig_iov.ptr  = (char *)sig;
+                sig_iov.size = siglen;
+        }
         encoded_signature = rd_base64_encode_str_urlsafe(&sig_iov);
 
         if (!encoded_signature)
@@ -1811,6 +1856,111 @@ static int ut_sasl_oauthbearer_oidc_assertion_create(void) {
         RD_UT_PASS();
 }
 
+/**
+ * @brief Decode an unpadded base64url string into \p out.
+ */
+static int ut_base64url_decode(const char *in, rd_chariov_t *out) {
+        size_t len    = strlen(in);
+        size_t padded = (len + 3) & ~(size_t)3;
+        char *buf     = rd_malloc(padded + 1);
+        rd_chariov_t in_iov;
+        size_t i;
+        int r;
+
+        for (i = 0; i < len; i++)
+                buf[i] = in[i] == '-' ? '+' : in[i] == '_' ? '/' : in[i];
+        for (; i < padded; i++)
+                buf[i] = '=';
+        buf[padded] = '\0';
+
+        in_iov.ptr  = buf;
+        in_iov.size = padded;
+        r           = rd_base64_decode(&in_iov, out);
+        rd_free(buf);
+        return r;
+}
+
+/**
+ * @brief Test ES256 JWT assertion creation.
+ *        Verifies that the signature is the 64-byte R || S form required
+ *        by JWS and that it verifies with the public key.
+ */
+static int ut_sasl_oauthbearer_oidc_assertion_create_es256(void) {
+        rd_kafka_t *rk;
+        /* Random key for signing */
+        const char *private_key_pem =
+            "-----BEGIN PRIVATE KEY-----\n"
+            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIJ7Ssz6W8jLvMl87\n"
+            "IAZB8XifmkZfDiKnP3cQs98RL62hRANCAAQxoVJu+hp1vbBORlWZDOm6PSDURp9R\n"
+            "UHbcQwmPMMseBIR2wL6Ib537JIxMKmZroFQIS08H+ZwV8JeB7xJbqNWB\n"
+            "-----END PRIVATE KEY-----\n";
+        char *jwt, *dot1, *dot2;
+        rd_chariov_t sig = RD_ZERO_INIT;
+        BIO *bio;
+        EVP_PKEY *pkey;
+        EVP_MD_CTX *mdctx;
+        ECDSA_SIG *ecdsa_sig;
+        unsigned char *der = NULL;
+        int der_len;
+
+        RD_UT_BEGIN();
+
+        rk = rd_calloc(1, sizeof(*rk));
+
+        jwt = rd_kafka_oidc_assertion_create(
+            rk, private_key_pem, NULL, NULL,
+            RD_KAFKA_SASL_OAUTHBEARER_ASSERTION_ALGORITHM_ES256, NULL,
+            "test-subject", "test-issuer", "test-audience", 2, 300, rd_true);
+        RD_UT_ASSERT(jwt != NULL, "Failed to create ES256 JWT assertion");
+
+        dot1 = strchr(jwt, '.');
+        dot2 = dot1 ? strchr(dot1 + 1, '.') : NULL;
+        RD_UT_ASSERT(dot2 != NULL, "JWT missing dot separators");
+
+        RD_UT_ASSERT(ut_base64url_decode(dot2 + 1, &sig) == 0,
+                     "Failed to decode JWT signature");
+        RD_UT_ASSERT(sig.size == 64,
+                     "Expected 64-byte R || S signature, got %" PRIusz " bytes",
+                     sig.size);
+
+        /* Re-encode as DER and verify over "header.payload" */
+        ecdsa_sig = ECDSA_SIG_new();
+        ECDSA_SIG_set0(ecdsa_sig, BN_bin2bn((unsigned char *)sig.ptr, 32, NULL),
+                       BN_bin2bn((unsigned char *)sig.ptr + 32, 32, NULL));
+        der_len = i2d_ECDSA_SIG(ecdsa_sig, &der);
+        RD_UT_ASSERT(der_len > 0, "Failed to DER-encode signature");
+
+        bio  = BIO_new_mem_buf((void *)private_key_pem, -1);
+        pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+        BIO_free(bio);
+        RD_UT_ASSERT(pkey != NULL, "Failed to load test key");
+
+        mdctx = EVP_MD_CTX_new();
+        RD_UT_ASSERT(
+            EVP_DigestVerifyInit(mdctx, NULL, EVP_sha256(), NULL, pkey) == 1 &&
+                EVP_DigestVerifyUpdate(mdctx, jwt, dot2 - jwt) == 1 &&
+                EVP_DigestVerifyFinal(mdctx, der, (size_t)der_len) == 1,
+            "ES256 signature verification failed");
+
+        EVP_MD_CTX_free(mdctx);
+        EVP_PKEY_free(pkey);
+        OPENSSL_free(der);
+        ECDSA_SIG_free(ecdsa_sig);
+        rd_free(sig.ptr);
+        rd_free(jwt);
+
+        /* An EC key with RS256 must be rejected */
+        jwt = rd_kafka_oidc_assertion_create(
+            rk, private_key_pem, NULL, NULL,
+            RD_KAFKA_SASL_OAUTHBEARER_ASSERTION_ALGORITHM_RS256, NULL,
+            "test-subject", "test-issuer", "test-audience", 2, 300, rd_true);
+        RD_UT_ASSERT(jwt == NULL, "Expected RS256 with an EC key to fail");
+
+        rd_free(rk);
+
+        RD_UT_PASS();
+}
+
 int unittest_sasl_oauthbearer_oidc_jwt_bearer(void) {
         int fails = 0;
 
@@ -1826,6 +1976,7 @@ int unittest_sasl_oauthbearer_oidc_assertion(void) {
         fails += ut_sasl_oauthbearer_oidc_assertion_parse_from_file();
         fails += ut_sasl_oauthbearer_oidc_assertion_process_template_file();
         fails += ut_sasl_oauthbearer_oidc_assertion_create();
+        fails += ut_sasl_oauthbearer_oidc_assertion_create_es256();
 
         return fails;
 }

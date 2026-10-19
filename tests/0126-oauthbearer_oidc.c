@@ -490,7 +490,8 @@ typedef enum oidc_configuration_jwt_bearer_variation_t {
          *  and a template for the JWT assertion. */
         OIDC_CONFIGURATION_JWT_BEARER_VARIATION_TEMPLATE_FILE,
         /** Use a private key file and set the JOSE algorithm to ES256.
-         *  This variation will fail as the private key is RSA in trivup  */
+         *  This variation fails locally as the private key is RSA in
+         *  trivup and ES256 requires a P-256 EC key. */
         OIDC_CONFIGURATION_JWT_BEARER_VARIATION_JOSE_ALGORITHM_ES256,
         /** Invalid scope */
         OIDC_CONFIGURATION_JWT_BEARER_VARIATION_INVALID_SCOPE,
@@ -579,7 +580,8 @@ static rd_kafka_conf_t *oidc_configuration_jwt_bearer(
         case OIDC_CONFIGURATION_JWT_BEARER_VARIATION_PRIVATE_KEY_STRING_ENCRYPTED:
                 if (!private_key_encrypted_file || !private_key_password)
                         goto fail;
-                TEST_ASSERT(test_read_file(private_key_file, file_content,
+                TEST_ASSERT(test_read_file(private_key_encrypted_file,
+                                           file_content,
                                            sizeof(file_content)) > 0);
 
                 test_conf_set(conf,
