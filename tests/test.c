@@ -8347,20 +8347,30 @@ rd_kafka_share_t *test_create_share_consumer_with_cb(
 }
 
 /**
- * @brief Wait for acknowledgement callbacks while polling.
+ * @brief Wait for acknowledgement callbacks while polling, for at most
+ *        \p timeout_ms by the clock.
+ *
+ * rd_kafka_share_poll() may return at once, e.g. with __STATE while
+ * records of an explicit-mode consumer are unacknowledged: then sleep the
+ * rest of the poll interval, so that the callbacks have \p timeout_ms to
+ * arrive however long each poll takes.
  */
 rd_bool_t test_wait_for_cb_with_poll(test_ack_cb_state_t *state,
                                      rd_kafka_share_t *rkshare,
                                      int min_callbacks,
                                      int timeout_ms) {
-        rd_bool_t success = rd_false;
-        int elapsed       = 0;
-        int poll_interval = 100;
+        rd_bool_t success     = rd_false;
+        const int poll_ms     = 100;
+        const int64_t abs_end = test_clock() + (int64_t)timeout_ms * 1000;
 
-        while (elapsed < timeout_ms) {
+        /* Polls once more at the deadline, for callbacks that arrived
+         * during the last sleep */
+        for (;;) {
                 rd_kafka_messages_t *batch = NULL;
+                int64_t poll_end = test_clock() + (int64_t)poll_ms * 1000;
+                int64_t remains;
                 rd_kafka_error_t *error =
-                    rd_kafka_share_poll(rkshare, poll_interval, &batch);
+                    rd_kafka_share_poll(rkshare, poll_ms, &batch);
                 if (error) {
                         TEST_SAY(
                             "test_wait_for_cb_with_poll: "
@@ -8376,7 +8386,13 @@ rd_bool_t test_wait_for_cb_with_poll(test_ack_cb_state_t *state,
                         success = rd_true;
                         break;
                 }
-                elapsed += poll_interval;
+                if (test_clock() >= abs_end)
+                        break;
+
+                /* The poll returned early: sleep the rest of its interval */
+                remains = RD_MIN(poll_end, abs_end) - test_clock();
+                if (remains > 0)
+                        rd_usleep((int)remains, NULL);
         }
         return success;
 }
