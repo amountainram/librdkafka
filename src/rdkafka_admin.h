@@ -651,6 +651,43 @@ typedef struct rd_kafka_ClusterDescription_s {
 /**@}*/
 
 /**
+ * @name DescribeFeatures
+ * @{
+ */
+
+/**
+ * @brief A feature and a range of its versions, public type.
+ */
+struct rd_kafka_FeatureVersionRange_s {
+        char *name;          /**< Feature name. */
+        int16_t min_version; /**< Minimum version (level), inclusive. */
+        int16_t max_version; /**< Maximum version (level), inclusive. */
+};
+
+/**
+ * @brief A protocol API and the range of its versions, public type.
+ */
+struct rd_kafka_ApiVersionRange_s {
+        int16_t api_key;     /**< API key. */
+        char *api_name;      /**< API name. */
+        int16_t min_version; /**< Minimum version, inclusive. */
+        int16_t max_version; /**< Maximum version, inclusive. */
+};
+
+/**
+ * @struct DescribeFeatures result - internal type.
+ */
+typedef struct rd_kafka_FeatureMetadata_s {
+        int32_t node_id;                  /**< The broker that answered. */
+        int64_t finalized_features_epoch; /**< -1 if unknown. */
+        rd_list_t finalized_features; /**< rd_kafka_FeatureVersionRange_t* */
+        rd_list_t supported_features; /**< rd_kafka_FeatureVersionRange_t* */
+        rd_list_t api_versions;       /**< rd_kafka_ApiVersionRange_t* */
+} rd_kafka_FeatureMetadata_t;
+
+/**@}*/
+
+/**
  * @name ElectLeaders
  * @{
  */

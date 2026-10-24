@@ -18,6 +18,7 @@ list_consumer_groups
 describe_consumer_groups
 describe_topics
 describe_topic_partitions
+describe_features
 describe_cluster
 list_consumer_group_offsets
 alter_consumer_group_offsets

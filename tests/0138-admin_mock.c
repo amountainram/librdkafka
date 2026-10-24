@@ -616,6 +616,290 @@ static void do_test_DescribeTopicPartitions_unsupported(void) {
         SUB_TEST_PASS();
 }
 
+/**
+ * @brief Calls DescribeFeatures on \p broker_id (-1 for the default, the
+ *        controller), and returns the result event: asserting its error is
+ *        \p exp_err.
+ */
+static rd_kafka_event_t *describe_features(rd_kafka_t *rk,
+                                           rd_kafka_queue_t *q,
+                                           int32_t broker_id,
+                                           int timeout_ms,
+                                           rd_kafka_resp_err_t exp_err) {
+        rd_kafka_AdminOptions_t *options =
+            rd_kafka_AdminOptions_new(rk, RD_KAFKA_ADMIN_OP_DESCRIBEFEATURES);
+        rd_kafka_event_t *event;
+        char errstr[512];
+
+        TEST_CALL_ERR__(rd_kafka_AdminOptions_set_request_timeout(
+            options, timeout_ms, errstr, sizeof(errstr)));
+        if (broker_id != -1)
+                TEST_CALL_ERR__(rd_kafka_AdminOptions_set_broker(
+                    options, broker_id, errstr, sizeof(errstr)));
+
+        rd_kafka_DescribeFeatures(rk, options, q);
+        event =
+            test_wait_admin_result(q, RD_KAFKA_EVENT_DESCRIBEFEATURES_RESULT,
+                                   timeout_ms + tmout_multip(5000));
+        TEST_ASSERT(rd_kafka_event_DescribeFeatures_result(event),
+                    "Expected DescribeFeatures result, got %s",
+                    rd_kafka_event_name(event));
+        TEST_ASSERT(rd_kafka_event_error(event) == exp_err,
+                    "Expected %s, got %s: %s", rd_kafka_err2name(exp_err),
+                    rd_kafka_err2name(rd_kafka_event_error(event)),
+                    rd_kafka_event_error_string(event));
+
+        rd_kafka_AdminOptions_destroy(options);
+        return event;
+}
+
+/**
+ * @brief Asserts \p features, \p cnt of them, are \p exp_names from
+ *        \p exp_min to \p exp_max, in order.
+ */
+static void assert_features(const char *what,
+                            const rd_kafka_FeatureVersionRange_t **features,
+                            size_t cnt,
+                            const char **exp_names,
+                            const int16_t *exp_min,
+                            const int16_t *exp_max,
+                            size_t exp_cnt) {
+        size_t i;
+
+        TEST_ASSERT(cnt == exp_cnt, "Expected %" PRIusz " %s, got %" PRIusz,
+                    exp_cnt, what, cnt);
+        for (i = 0; i < cnt; i++) {
+                const char *name =
+                    rd_kafka_FeatureVersionRange_name(features[i]);
+                int16_t min =
+                    rd_kafka_FeatureVersionRange_min_version(features[i]);
+                int16_t max =
+                    rd_kafka_FeatureVersionRange_max_version(features[i]);
+                TEST_ASSERT(!strcmp(name, exp_names[i]) && min == exp_min[i] &&
+                                max == exp_max[i],
+                            "Expected %s #%" PRIusz
+                            " %s %hd..%hd, got "
+                            "%s %hd..%hd",
+                            what, i, exp_names[i], exp_min[i], exp_max[i], name,
+                            min, max);
+        }
+}
+
+/**
+ * @brief Asserts the API versions of \p result are sorted, and include
+ *        ApiVersion up to \p exp_ApiVersion_max.
+ */
+static void
+assert_api_versions(const rd_kafka_DescribeFeatures_result_t *result,
+                    int16_t exp_ApiVersion_max) {
+        const rd_kafka_ApiVersionRange_t **apis;
+        rd_bool_t found = rd_false;
+        size_t cnt, i;
+
+        apis = rd_kafka_DescribeFeatures_result_api_versions(result, &cnt);
+        TEST_ASSERT(cnt > 10, "Expected the mock's APIs, got %" PRIusz, cnt);
+        for (i = 0; i < cnt; i++) {
+                int16_t key = rd_kafka_ApiVersionRange_api_key(apis[i]);
+                TEST_ASSERT(i == 0 || key > rd_kafka_ApiVersionRange_api_key(
+                                                apis[i - 1]),
+                            "Expected the APIs sorted by key");
+                if (key != RD_KAFKAP_ApiVersion)
+                        continue;
+                found = rd_true;
+                TEST_ASSERT(!strcmp(rd_kafka_ApiVersionRange_api_name(apis[i]),
+                                    "ApiVersion") &&
+                                rd_kafka_ApiVersionRange_min_version(apis[i]) ==
+                                    0 &&
+                                rd_kafka_ApiVersionRange_max_version(apis[i]) ==
+                                    exp_ApiVersion_max,
+                            "Expected ApiVersion 0..%hd, got %s %hd..%hd",
+                            exp_ApiVersion_max,
+                            rd_kafka_ApiVersionRange_api_name(apis[i]),
+                            rd_kafka_ApiVersionRange_min_version(apis[i]),
+                            rd_kafka_ApiVersionRange_max_version(apis[i]));
+        }
+        TEST_ASSERT(found, "Expected ApiVersion among the APIs");
+}
+
+/**
+ * @brief DescribeFeatures: the finalized and supported features and the API
+ *        versions, from the controller or a given broker.
+ */
+static void do_test_DescribeFeatures(void) {
+        rd_kafka_conf_t *conf;
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        const char *bootstraps;
+        rd_kafka_queue_t *q;
+        rd_kafka_event_t *event;
+        const rd_kafka_DescribeFeatures_result_t *result;
+        const rd_kafka_FeatureVersionRange_t **features;
+        const char *supported[]       = {"metadata.version", "group.version",
+                                         "kraft.version"};
+        const int16_t supported_min[] = {1, 0, 0};
+        const int16_t supported_max[] = {27, 1, 1};
+        const char *finalized[]       = {"metadata.version", "group.version"};
+        const int16_t finalized_min[] = {21, 1};
+        const int16_t finalized_max[] = {21, 1};
+        int32_t broker_id;
+        size_t cnt;
+
+        SUB_TEST_QUICK();
+
+        test_conf_init(&conf, NULL, 60);
+        mcluster = test_mock_cluster_new(3, &bootstraps);
+        TEST_CALL_ERR__(
+            rd_kafka_mock_set_feature(mcluster, "metadata.version", 1, 27, 21));
+        TEST_CALL_ERR__(
+            rd_kafka_mock_set_feature(mcluster, "group.version", 0, 1, 1));
+        TEST_CALL_ERR__(
+            rd_kafka_mock_set_feature(mcluster, "kraft.version", 0, 1, -1));
+        TEST_ASSERT(rd_kafka_mock_set_feature(mcluster, "bad", 2, 1, -1) ==
+                        RD_KAFKA_RESP_ERR__INVALID_ARG,
+                    "Expected a max version below the min one to be refused");
+        rd_kafka_mock_set_controller_id(mcluster, 1);
+        test_conf_set(conf, "bootstrap.servers", bootstraps);
+        rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
+        q  = rd_kafka_queue_new(rk);
+
+        TEST_SAY("The controller, by default\n");
+        event  = describe_features(rk, q, -1, tmout_multip(5000), 0);
+        result = rd_kafka_event_DescribeFeatures_result(event);
+        TEST_ASSERT(rd_kafka_DescribeFeatures_result_node_id(result) == 1,
+                    "Expected the controller 1 to answer, got %" PRId32,
+                    rd_kafka_DescribeFeatures_result_node_id(result));
+        /* Finalizing two features: epochs 0 then 1 */
+        TEST_ASSERT(
+            rd_kafka_DescribeFeatures_result_finalized_features_epoch(result) ==
+                1,
+            "Expected epoch 1, got %" PRId64,
+            rd_kafka_DescribeFeatures_result_finalized_features_epoch(result));
+        features =
+            rd_kafka_DescribeFeatures_result_finalized_features(result, &cnt);
+        assert_features("finalized features", features, cnt, finalized,
+                        finalized_min, finalized_max, 2);
+        features =
+            rd_kafka_DescribeFeatures_result_supported_features(result, &cnt);
+        assert_features("supported features", features, cnt, supported,
+                        supported_min, supported_max, 3);
+        assert_api_versions(result, 4);
+        rd_kafka_event_destroy(event);
+
+        for (broker_id = 1; broker_id <= 3; broker_id++) {
+                TEST_SAY("Broker %" PRId32 "\n", broker_id);
+                event =
+                    describe_features(rk, q, broker_id, tmout_multip(5000), 0);
+                result = rd_kafka_event_DescribeFeatures_result(event);
+                TEST_ASSERT(rd_kafka_DescribeFeatures_result_node_id(result) ==
+                                broker_id,
+                            "Expected broker %" PRId32
+                            " to answer, got %" PRId32,
+                            broker_id,
+                            rd_kafka_DescribeFeatures_result_node_id(result));
+                rd_kafka_event_destroy(event);
+        }
+
+        TEST_SAY("An error from the broker fails the request\n");
+        TEST_CALL_ERR__(rd_kafka_mock_broker_push_request_error_rtts(
+            mcluster, 2, RD_KAFKAP_ApiVersion, 1,
+            RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED, 0));
+        event =
+            describe_features(rk, q, 2, tmout_multip(5000),
+                              RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED);
+        result = rd_kafka_event_DescribeFeatures_result(event);
+        TEST_ASSERT(rd_kafka_DescribeFeatures_result_node_id(result) == -1,
+                    "Expected no broker on a failed request");
+        rd_kafka_DescribeFeatures_result_api_versions(result, &cnt);
+        TEST_ASSERT(cnt == 0, "Expected no APIs on a failed request");
+        rd_kafka_event_destroy(event);
+
+        TEST_SAY("An unknown broker times out\n");
+        event = describe_features(rk, q, 99, tmout_multip(1000),
+                                  RD_KAFKA_RESP_ERR__TIMED_OUT);
+        rd_kafka_event_destroy(event);
+
+        rd_kafka_queue_destroy(q);
+        rd_kafka_destroy(rk);
+        test_mock_cluster_destroy(mcluster);
+        SUB_TEST_PASS();
+}
+
+/**
+ * @brief DescribeFeatures on brokers with older ApiVersion versions: v3
+ *        leaves out the supported features with a minimum version of 0, v2
+ *        has no features at all.
+ */
+static void do_test_DescribeFeatures_older_brokers(int16_t ApiVersion_max) {
+        rd_kafka_conf_t *conf;
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        const char *bootstraps;
+        rd_kafka_queue_t *q;
+        rd_kafka_event_t *event;
+        const rd_kafka_DescribeFeatures_result_t *result;
+        const rd_kafka_FeatureVersionRange_t **features;
+        const char *supported[]       = {"metadata.version"};
+        const int16_t supported_min[] = {1};
+        const int16_t supported_max[] = {27};
+        const char *finalized[]       = {"metadata.version"};
+        const int16_t finalized_min[] = {21};
+        const int16_t finalized_max[] = {21};
+        size_t cnt;
+
+        SUB_TEST_QUICK("ApiVersion v0..%hd", ApiVersion_max);
+
+        test_conf_init(&conf, NULL, 60);
+        mcluster = test_mock_cluster_new(1, &bootstraps);
+        TEST_CALL_ERR__(
+            rd_kafka_mock_set_feature(mcluster, "metadata.version", 1, 27, 21));
+        TEST_CALL_ERR__(
+            rd_kafka_mock_set_feature(mcluster, "group.version", 0, 1, -1));
+        TEST_CALL_ERR__(rd_kafka_mock_set_apiversion(
+            mcluster, RD_KAFKAP_ApiVersion, 0, ApiVersion_max));
+        rd_kafka_mock_set_controller_id(mcluster, 1);
+        test_conf_set(conf, "bootstrap.servers", bootstraps);
+        rk = test_create_handle(RD_KAFKA_PRODUCER, conf);
+        q  = rd_kafka_queue_new(rk);
+
+        event  = describe_features(rk, q, -1, tmout_multip(5000), 0);
+        result = rd_kafka_event_DescribeFeatures_result(event);
+        assert_api_versions(result, ApiVersion_max);
+
+        features =
+            rd_kafka_DescribeFeatures_result_supported_features(result, &cnt);
+        if (ApiVersion_max >= 3) {
+                assert_features("supported features", features, cnt, supported,
+                                supported_min, supported_max, 1);
+                features = rd_kafka_DescribeFeatures_result_finalized_features(
+                    result, &cnt);
+                assert_features("finalized features", features, cnt, finalized,
+                                finalized_min, finalized_max, 1);
+                TEST_ASSERT(
+                    rd_kafka_DescribeFeatures_result_finalized_features_epoch(
+                        result) == 0,
+                    "Expected epoch 0");
+        } else {
+                TEST_ASSERT(cnt == 0,
+                            "Expected no supported features, got %" PRIusz,
+                            cnt);
+                rd_kafka_DescribeFeatures_result_finalized_features(result,
+                                                                    &cnt);
+                TEST_ASSERT(cnt == 0,
+                            "Expected no finalized features, got %" PRIusz,
+                            cnt);
+                TEST_ASSERT(
+                    rd_kafka_DescribeFeatures_result_finalized_features_epoch(
+                        result) == -1,
+                    "Expected an unknown epoch");
+        }
+        rd_kafka_event_destroy(event);
+
+        rd_kafka_queue_destroy(q);
+        rd_kafka_destroy(rk);
+        test_mock_cluster_destroy(mcluster);
+        SUB_TEST_PASS();
+}
+
 int main_0138_admin_mock(int argc, char **argv) {
 
         TEST_SKIP_MOCK_CLUSTER(0);
@@ -631,6 +915,10 @@ int main_0138_admin_mock(int argc, char **argv) {
 
         do_test_DescribeTopicPartitions();
         do_test_DescribeTopicPartitions_unsupported();
+
+        do_test_DescribeFeatures();
+        do_test_DescribeFeatures_older_brokers(3);
+        do_test_DescribeFeatures_older_brokers(2);
 
         return 0;
 }

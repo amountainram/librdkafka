@@ -548,6 +548,27 @@ rd_kafka_mock_set_apiversion(rd_kafka_mock_cluster_t *mcluster,
                              int16_t MaxVersion);
 
 /**
+ * @brief Set feature \p name (KIP-584), added if new, in the brokers'
+ *        ApiVersion responses: supported from \p min_version to
+ *        \p max_version, and finalized cluster-wide at \p finalized_level,
+ *        or not finalized if -1.
+ *
+ *        Finalizing a feature bumps the finalized features epoch, -1 until
+ *        then. The brokers report no features by default.
+ *
+ * @remark Supported features with a \p min_version of 0 are only reported
+ *         to ApiVersion requests v4+, as Apache Kafka does (KAFKA-17011).
+ *
+ * @returns RD_KAFKA_RESP_ERR__INVALID_ARG if the versions are out of range.
+ */
+RD_EXPORT rd_kafka_resp_err_t
+rd_kafka_mock_set_feature(rd_kafka_mock_cluster_t *mcluster,
+                          const char *name,
+                          int16_t min_version,
+                          int16_t max_version,
+                          int16_t finalized_level);
+
+/**
  * @brief Start tracking RPC requests for this mock cluster.
  * @sa rd_kafka_mock_get_requests to get the requests.
  */

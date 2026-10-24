@@ -5377,7 +5377,7 @@ const struct rd_kafka_mock_api_handler
         [RD_KAFKAP_ListOffsets]  = {0, 7, 6, rd_kafka_mock_handle_ListOffsets},
         [RD_KAFKAP_OffsetFetch]  = {0, 6, 6, rd_kafka_mock_handle_OffsetFetch},
         [RD_KAFKAP_OffsetCommit] = {0, 9, 8, rd_kafka_mock_handle_OffsetCommit},
-        [RD_KAFKAP_ApiVersion]   = {0, 2, 3, rd_kafka_mock_handle_ApiVersion},
+        [RD_KAFKAP_ApiVersion]   = {0, 4, 3, rd_kafka_mock_handle_ApiVersion},
         [RD_KAFKAP_Metadata]     = {0, 13, 9, rd_kafka_mock_handle_Metadata},
         [RD_KAFKAP_FindCoordinator] = {0, 3, 3,
                                        rd_kafka_mock_handle_FindCoordinator},
@@ -5414,6 +5414,140 @@ const struct rd_kafka_mock_api_handler
 
 
 /**
+ * @returns true if \p mfeature is reported as supported in an
+ *          ApiVersionResponse of version \p ApiVersion: before v4, Apache Kafka
+ *          leaves out the features with a minimum version of 0
+ *          (KAFKA-17011).
+ */
+static rd_bool_t rd_kafka_mock_feature_supported_reported(
+    const rd_kafka_mock_feature_t *mfeature,
+    int16_t ApiVersion) {
+        return mfeature->min_version > 0 || ApiVersion >= 4;
+}
+
+/**
+ * @brief Writes the value of tagged field \p tagtype of an
+ *        ApiVersionResponse: the features (KIP-584).
+ */
+static void
+rd_kafka_mock_ApiVersion_reply_tags_write(rd_kafka_buf_t *rkbuf,
+                                          int tagtype,
+                                          rd_kafka_mock_cluster_t *mcluster,
+                                          int16_t ApiVersion) {
+        const rd_kafka_mock_feature_t *mfeature;
+        int cnt = 0;
+        int i;
+
+        switch (tagtype) {
+        case 0: /* SupportedFeatures */
+                RD_LIST_FOREACH(mfeature, &mcluster->features, i) {
+                        if (rd_kafka_mock_feature_supported_reported(
+                                mfeature, ApiVersion))
+                                cnt++;
+                }
+                rd_kafka_buf_write_arraycnt(rkbuf, cnt);
+                RD_LIST_FOREACH(mfeature, &mcluster->features, i) {
+                        if (!rd_kafka_mock_feature_supported_reported(
+                                mfeature, ApiVersion))
+                                continue;
+                        rd_kafka_buf_write_str(rkbuf, mfeature->name, -1);
+                        rd_kafka_buf_write_i16(rkbuf, mfeature->min_version);
+                        rd_kafka_buf_write_i16(rkbuf, mfeature->max_version);
+                        rd_kafka_buf_write_tags_empty(rkbuf);
+                }
+                break;
+        case 1: /* FinalizedFeaturesEpoch */
+                rd_kafka_buf_write_i64(rkbuf,
+                                       mcluster->finalized_features_epoch);
+                break;
+        case 2: /* FinalizedFeatures */
+                RD_LIST_FOREACH(mfeature, &mcluster->features, i) {
+                        if (mfeature->finalized_level != -1)
+                                cnt++;
+                }
+                rd_kafka_buf_write_arraycnt(rkbuf, cnt);
+                RD_LIST_FOREACH(mfeature, &mcluster->features, i) {
+                        if (mfeature->finalized_level == -1)
+                                continue;
+                        rd_kafka_buf_write_str(rkbuf, mfeature->name, -1);
+                        /* MaxVersionLevel, MinVersionLevel: the level, as
+                         * Apache Kafka reports it since KIP-778 */
+                        rd_kafka_buf_write_i16(rkbuf,
+                                               mfeature->finalized_level);
+                        rd_kafka_buf_write_i16(rkbuf,
+                                               mfeature->finalized_level);
+                        rd_kafka_buf_write_tags_empty(rkbuf);
+                }
+                break;
+        default:
+                break;
+        }
+}
+
+/**
+ * @brief Writes a successful ApiVersionResponse of version \p ApiVersion
+ *        (v3+) in \p resp: flexver, with the features as tagged fields, but
+ *        without response header tags (see rd_kafka_mock_buf_new_response()).
+ */
+static void
+rd_kafka_mock_buf_write_ApiVersion_flexver(rd_kafka_mock_cluster_t *mcluster,
+                                           rd_kafka_buf_t *resp,
+                                           int16_t ApiVersion) {
+        const rd_kafka_mock_feature_t *mfeature;
+        rd_bool_t supported = rd_false, finalized = rd_false;
+        int tags[3];
+        size_t tag_cnt = 0;
+        int cnt        = 0;
+        int i;
+
+        /* ErrorCode */
+        rd_kafka_buf_write_i16(resp, RD_KAFKA_RESP_ERR_NO_ERROR);
+
+        /* #ApiKeys */
+        for (i = 0; i < RD_KAFKAP__NUM; i++) {
+                if (mcluster->api_handlers[i].cb &&
+                    mcluster->api_handlers[i].MaxVersion != -1)
+                        cnt++;
+        }
+        rd_kafka_buf_write_arraycnt(resp, cnt);
+
+        for (i = 0; i < RD_KAFKAP__NUM; i++) {
+                if (!mcluster->api_handlers[i].cb ||
+                    mcluster->api_handlers[i].MaxVersion == -1)
+                        continue;
+
+                /* ApiKey */
+                rd_kafka_buf_write_i16(resp, (int16_t)i);
+                /* MinVersion */
+                rd_kafka_buf_write_i16(resp,
+                                       mcluster->api_handlers[i].MinVersion);
+                /* MaxVersion */
+                rd_kafka_buf_write_i16(resp,
+                                       mcluster->api_handlers[i].MaxVersion);
+                rd_kafka_buf_write_tags_empty(resp);
+        }
+
+        /* ThrottleTimeMs */
+        rd_kafka_buf_write_i32(resp, 0);
+
+        RD_LIST_FOREACH(mfeature, &mcluster->features, i) {
+                if (rd_kafka_mock_feature_supported_reported(mfeature,
+                                                             ApiVersion))
+                        supported = rd_true;
+                if (mfeature->finalized_level != -1)
+                        finalized = rd_true;
+        }
+        if (supported)
+                tags[tag_cnt++] = 0; /* SupportedFeatures */
+        if (finalized) {
+                tags[tag_cnt++] = 1; /* FinalizedFeaturesEpoch */
+                tags[tag_cnt++] = 2; /* FinalizedFeatures */
+        }
+        rd_kafka_buf_write_tags(resp, rd_kafka_mock_ApiVersion_reply_tags_write,
+                                tags, tag_cnt, mcluster, ApiVersion);
+}
+
+/**
  * @brief Handle ApiVersionRequest.
  *
  * @remark This is the only handler that needs to handle unsupported
@@ -5435,6 +5569,13 @@ static int rd_kafka_mock_handle_ApiVersion(rd_kafka_mock_connection_t *mconn,
                         mcluster, rkbuf->rkbuf_reqhdr.ApiKey,
                         rkbuf->rkbuf_reqhdr.ApiVersion))
                 err = RD_KAFKA_RESP_ERR_UNSUPPORTED_VERSION;
+
+        if (!err && rkbuf->rkbuf_reqhdr.ApiVersion >= 3) {
+                rd_kafka_mock_buf_write_ApiVersion_flexver(
+                    mcluster, resp, rkbuf->rkbuf_reqhdr.ApiVersion);
+                rd_kafka_mock_connection_send_response(mconn, resp);
+                return 0;
+        }
 
         /* ApiVersionRequest/Response with flexver (>=v3) has a mix
          * of flexver and standard fields for backwards compatibility reasons,

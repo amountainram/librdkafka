@@ -3357,20 +3357,11 @@ done:
 
 
 /**
- * @brief Send ApiVersionRequest (KIP-35)
- *
- * @param ApiVersion If -1 use the highest supported version, else use the
- *                   specified value.
+ * @brief Construct an ApiVersionRequest of version \p ApiVersion (no send).
  */
-void rd_kafka_ApiVersionRequest(rd_kafka_broker_t *rkb,
-                                int16_t ApiVersion,
-                                rd_kafka_replyq_t replyq,
-                                rd_kafka_resp_cb_t *resp_cb,
-                                void *opaque) {
+static rd_kafka_buf_t *rd_kafka_ApiVersionRequest_new(rd_kafka_broker_t *rkb,
+                                                      int16_t ApiVersion) {
         rd_kafka_buf_t *rkbuf;
-
-        if (ApiVersion == -1)
-                ApiVersion = 3;
 
         rkbuf = rd_kafka_buf_new_flexver_request(
             rkb, RD_KAFKAP_ApiVersion, 1, 3, ApiVersion >= 3 /*flexver*/);
@@ -3387,6 +3378,29 @@ void rd_kafka_ApiVersionRequest(rd_kafka_broker_t *rkb,
                                        -1);
         }
 
+        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
+
+        return rkbuf;
+}
+
+/**
+ * @brief Send ApiVersionRequest (KIP-35)
+ *
+ * @param ApiVersion If -1 use the highest supported version, else use the
+ *                   specified value.
+ */
+void rd_kafka_ApiVersionRequest(rd_kafka_broker_t *rkb,
+                                int16_t ApiVersion,
+                                rd_kafka_replyq_t replyq,
+                                rd_kafka_resp_cb_t *resp_cb,
+                                void *opaque) {
+        rd_kafka_buf_t *rkbuf;
+
+        if (ApiVersion == -1)
+                ApiVersion = 3;
+
+        rkbuf = rd_kafka_ApiVersionRequest_new(rkb, ApiVersion);
+
         /* Should be sent before any other requests since it is part of
          * the initial connection handshake. */
         rkbuf->rkbuf_prio = RD_KAFKA_PRIO_FLASH;
@@ -3401,13 +3415,56 @@ void rd_kafka_ApiVersionRequest(rd_kafka_broker_t *rkb,
         rd_kafka_buf_set_abs_timeout(
             rkbuf, rkb->rkb_rk->rk_conf.api_version_request_timeout_ms, 0);
 
-        rd_kafka_buf_ApiVersion_set(rkbuf, ApiVersion, 0);
-
         if (replyq.q)
                 rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb,
                                                opaque);
         else /* in broker thread */
                 rd_kafka_broker_buf_enq1(rkb, rkbuf, resp_cb, opaque);
+}
+
+
+/**
+ * @brief Construct and send an ApiVersionRequest to \p rkb on an established
+ *        connection, for DescribeFeatures (KIP-584): unlike the connection
+ *        handshake's, it's an ordinary request, with the highest version
+ *        both sides support, and its features in the response from v3.
+ *
+ *        The response (unparsed) will be enqueued on \p replyq
+ *        for handling by \p resp_cb (with \p opaque passed).
+ *
+ * @returns RD_KAFKA_RESP_ERR_NO_ERROR if the request was enqueued for
+ *          transmission, otherwise an error code and errstr will be
+ *          updated with a human readable error string.
+ */
+rd_kafka_resp_err_t
+rd_kafka_ApiVersionRequest_admin(rd_kafka_broker_t *rkb,
+                                 const rd_list_t *ignored /* no arguments */,
+                                 rd_kafka_AdminOptions_t *options,
+                                 char *errstr,
+                                 size_t errstr_size,
+                                 rd_kafka_replyq_t replyq,
+                                 rd_kafka_resp_cb_t *resp_cb,
+                                 void *opaque) {
+        rd_kafka_buf_t *rkbuf;
+        int16_t ApiVersion;
+
+        /* v4: the broker reports the supported features with a minimum
+         * version of 0 too (KAFKA-17011) */
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(
+            rkb, RD_KAFKAP_ApiVersion, 0, 4, NULL);
+        if (ApiVersion == -1) {
+                rd_snprintf(errstr, errstr_size,
+                            "ApiVersion request not supported by broker, "
+                            "requires broker version >= 0.10.0");
+                rd_kafka_replyq_destroy(&replyq);
+                return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
+        }
+
+        rkbuf = rd_kafka_ApiVersionRequest_new(rkb, ApiVersion);
+
+        rd_kafka_broker_buf_enq_replyq(rkb, rkbuf, replyq, resp_cb, opaque);
+
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
 }
 
 

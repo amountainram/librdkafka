@@ -62,6 +62,9 @@ target_link_libraries(describe_topic_partitions PUBLIC rdkafka)
 add_executable(describe_cluster describe_cluster.c ${win32_sources})
 target_link_libraries(describe_cluster PUBLIC rdkafka)
 
+add_executable(describe_features describe_features.c ${win32_sources})
+target_link_libraries(describe_features PUBLIC rdkafka)
+
 add_executable(list_offsets list_offsets.c ${win32_sources})
 target_link_libraries(list_offsets PUBLIC rdkafka)
 

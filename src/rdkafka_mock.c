@@ -2845,6 +2845,23 @@ rd_kafka_mock_set_apiversion(rd_kafka_mock_cluster_t *mcluster,
             rd_kafka_op_req(mcluster->ops, rko, RD_POLL_INFINITE));
 }
 
+rd_kafka_resp_err_t rd_kafka_mock_set_feature(rd_kafka_mock_cluster_t *mcluster,
+                                              const char *name,
+                                              int16_t min_version,
+                                              int16_t max_version,
+                                              int16_t finalized_level) {
+        rd_kafka_op_t *rko = rd_kafka_op_new(RD_KAFKA_OP_MOCK);
+
+        rko->rko_u.mock.name      = rd_strdup(name);
+        rko->rko_u.mock.lo        = min_version;
+        rko->rko_u.mock.hi        = max_version;
+        rko->rko_u.mock.partition = finalized_level;
+        rko->rko_u.mock.cmd       = RD_KAFKA_MOCK_CMD_FEATURE_SET;
+
+        return rd_kafka_op_err_destroy(
+            rd_kafka_op_req(mcluster->ops, rko, RD_POLL_INFINITE));
+}
+
 rd_kafka_resp_err_t
 rd_kafka_mock_telemetry_set_requested_metrics(rd_kafka_mock_cluster_t *mcluster,
                                               char **metrics,
@@ -2988,6 +3005,53 @@ rd_kafka_mock_brokers_cmd(rd_kafka_mock_cluster_t *mcluster,
         }
 
         return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+
+static void rd_kafka_mock_feature_free(void *ptr) {
+        rd_kafka_mock_feature_t *mfeature = ptr;
+        rd_free(mfeature->name);
+        rd_free(mfeature);
+}
+
+/**
+ * @brief Sets feature \p name, added if new: supported from \p min_version
+ *        to \p max_version, finalized at \p finalized_level, or not if -1.
+ *        Finalizing it bumps the finalized features epoch.
+ *
+ * @returns 0 on success, -1 on invalid arguments.
+ *
+ * @locality mcluster thread
+ */
+static int rd_kafka_mock_feature_set(rd_kafka_mock_cluster_t *mcluster,
+                                     const char *name,
+                                     int16_t min_version,
+                                     int16_t max_version,
+                                     int16_t finalized_level) {
+        rd_kafka_mock_feature_t *mfeature = NULL;
+        int i;
+
+        if (!name || !*name || min_version < 0 || max_version < min_version ||
+            finalized_level < -1 || finalized_level > max_version)
+                return -1;
+
+        RD_LIST_FOREACH(mfeature, &mcluster->features, i) {
+                if (!strcmp(mfeature->name, name))
+                        break;
+        }
+        if (!mfeature) {
+                mfeature       = rd_calloc(1, sizeof(*mfeature));
+                mfeature->name = rd_strdup(name);
+                rd_list_add(&mcluster->features, mfeature);
+        }
+
+        mfeature->min_version     = min_version;
+        mfeature->max_version     = max_version;
+        mfeature->finalized_level = finalized_level;
+        if (finalized_level != -1)
+                mcluster->finalized_features_epoch++;
+
+        return 0;
 }
 
 
@@ -3223,6 +3287,15 @@ rd_kafka_mock_cluster_cmd(rd_kafka_mock_cluster_t *mcluster,
                     .MaxVersion = (int16_t)rko->rko_u.mock.hi;
                 break;
 
+        case RD_KAFKA_MOCK_CMD_FEATURE_SET:
+                if (rd_kafka_mock_feature_set(
+                        mcluster, rko->rko_u.mock.name,
+                        (int16_t)rko->rko_u.mock.lo,
+                        (int16_t)rko->rko_u.mock.hi,
+                        (int16_t)rko->rko_u.mock.partition) == -1)
+                        return RD_KAFKA_RESP_ERR__INVALID_ARG;
+                break;
+
         case RD_KAFKA_MOCK_CMD_REQUESTED_METRICS_SET:
                 mcluster->metrics_cnt = rko->rko_u.mock.hi;
                 if (!mcluster->metrics_cnt)
@@ -3338,6 +3411,8 @@ static void rd_kafka_mock_cluster_destroy0(rd_kafka_mock_cluster_t *mcluster) {
 
         rd_list_destroy(&mcluster->request_list);
 
+        rd_list_destroy(&mcluster->features);
+
         dummy_rkb_thread = mcluster->dummy_rkb->rkb_thread;
 
         /*
@@ -3448,6 +3523,9 @@ rd_kafka_mock_cluster_t *rd_kafka_mock_cluster_new(rd_kafka_t *rk,
         TAILQ_INIT(&mcluster->coords);
 
         rd_list_init(&mcluster->pids, 16, rd_free);
+
+        rd_list_init(&mcluster->features, 0, rd_kafka_mock_feature_free);
+        mcluster->finalized_features_epoch = -1;
 
         TAILQ_INIT(&mcluster->transactions);
 

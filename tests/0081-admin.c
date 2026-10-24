@@ -3836,6 +3836,144 @@ done:
 }
 
 /**
+ * @brief Test DescribeFeatures for the test cluster: from the controller,
+ *        then from each broker.
+ */
+static void do_test_DescribeFeatures(const char *what,
+                                     rd_kafka_t *rk,
+                                     rd_kafka_queue_t *rkqu,
+                                     int request_timeout) {
+        rd_kafka_queue_t *q;
+        rd_kafka_AdminOptions_t *options;
+        rd_kafka_event_t *rkev;
+        rd_kafka_resp_err_t err;
+        const rd_kafka_DescribeFeatures_result_t *res;
+        const rd_kafka_FeatureVersionRange_t **finalized, **supported;
+        const rd_kafka_ApiVersionRange_t **apis;
+        size_t finalized_cnt, supported_cnt, api_cnt, i;
+        int16_t ApiVersion_max     = -1;
+        int16_t metadata_version   = -1;
+        rd_bool_t metadata_support = rd_false;
+        int32_t *broker_ids;
+        size_t broker_cnt, b;
+        char errstr[128];
+
+        SUB_TEST_QUICK("%s DescribeFeatures with %s, request_timeout %d",
+                       rd_kafka_name(rk), what, request_timeout);
+
+        q = rkqu ? rkqu : rd_kafka_queue_new(rk);
+
+        options =
+            rd_kafka_AdminOptions_new(rk, RD_KAFKA_ADMIN_OP_DESCRIBEFEATURES);
+        TEST_CALL_ERR__(rd_kafka_AdminOptions_set_request_timeout(
+            options, request_timeout, errstr, sizeof(errstr)));
+        rd_kafka_DescribeFeatures(rk, options, q);
+        rd_kafka_AdminOptions_destroy(options);
+
+        rkev = test_wait_admin_result(q, RD_KAFKA_EVENT_DESCRIBEFEATURES_RESULT,
+                                      tmout_multip(20 * 1000));
+        res  = rd_kafka_event_DescribeFeatures_result(rkev);
+        TEST_ASSERT(res, "Expected DescribeFeatures result, not %s",
+                    rd_kafka_event_name(rkev));
+        err = rd_kafka_event_error(rkev);
+        TEST_ASSERT(!err, "Expected success, not %s: %s",
+                    rd_kafka_err2name(err), rd_kafka_event_error_string(rkev));
+
+        TEST_ASSERT(rd_kafka_DescribeFeatures_result_node_id(res) >= 0,
+                    "Expected the id of the broker answering");
+
+        apis = rd_kafka_DescribeFeatures_result_api_versions(res, &api_cnt);
+        for (i = 0; i < api_cnt; i++) {
+                if (rd_kafka_ApiVersionRange_api_key(apis[i]) == 18)
+                        ApiVersion_max =
+                            rd_kafka_ApiVersionRange_max_version(apis[i]);
+        }
+        TEST_ASSERT(ApiVersion_max >= 0,
+                    "Expected ApiVersion among the %" PRIusz " APIs", api_cnt);
+
+        finalized = rd_kafka_DescribeFeatures_result_finalized_features(
+            res, &finalized_cnt);
+        supported = rd_kafka_DescribeFeatures_result_supported_features(
+            res, &supported_cnt);
+        for (i = 0; i < finalized_cnt; i++) {
+                TEST_SAY(
+                    "Finalized %s at %hd..%hd\n",
+                    rd_kafka_FeatureVersionRange_name(finalized[i]),
+                    rd_kafka_FeatureVersionRange_min_version(finalized[i]),
+                    rd_kafka_FeatureVersionRange_max_version(finalized[i]));
+                if (!strcmp(rd_kafka_FeatureVersionRange_name(finalized[i]),
+                            "metadata.version"))
+                        metadata_version =
+                            rd_kafka_FeatureVersionRange_max_version(
+                                finalized[i]);
+        }
+        for (i = 0; i < supported_cnt; i++) {
+                if (strcmp(rd_kafka_FeatureVersionRange_name(supported[i]),
+                           "metadata.version"))
+                        continue;
+                metadata_support =
+                    rd_kafka_FeatureVersionRange_min_version(supported[i]) <=
+                        metadata_version &&
+                    metadata_version <=
+                        rd_kafka_FeatureVersionRange_max_version(supported[i]);
+        }
+
+        /* KRaft clusters, all of them from Apache Kafka 4.0, finalize
+         * metadata.version */
+        if (test_broker_version >= TEST_BRKVER(4, 0, 0, 0)) {
+                TEST_ASSERT(
+                    rd_kafka_DescribeFeatures_result_finalized_features_epoch(
+                        res) >= 0,
+                    "Expected a known finalized features epoch");
+                TEST_ASSERT(metadata_version > 0,
+                            "Expected metadata.version to be finalized");
+                TEST_ASSERT(metadata_support,
+                            "Expected the broker to support metadata.version "
+                            "%hd",
+                            metadata_version);
+        }
+
+        rd_kafka_event_destroy(rkev);
+
+        /* Each broker */
+        broker_ids = test_get_broker_ids(rk, &broker_cnt);
+        for (b = 0; b < broker_cnt; b++) {
+                options = rd_kafka_AdminOptions_new(
+                    rk, RD_KAFKA_ADMIN_OP_DESCRIBEFEATURES);
+                TEST_CALL_ERR__(rd_kafka_AdminOptions_set_request_timeout(
+                    options, request_timeout, errstr, sizeof(errstr)));
+                TEST_CALL_ERR__(rd_kafka_AdminOptions_set_broker(
+                    options, broker_ids[b], errstr, sizeof(errstr)));
+                rd_kafka_DescribeFeatures(rk, options, q);
+                rd_kafka_AdminOptions_destroy(options);
+
+                rkev = test_wait_admin_result(
+                    q, RD_KAFKA_EVENT_DESCRIBEFEATURES_RESULT,
+                    tmout_multip(20 * 1000));
+                res = rd_kafka_event_DescribeFeatures_result(rkev);
+                err = rd_kafka_event_error(rkev);
+                TEST_ASSERT(!err,
+                            "Expected success from broker %" PRId32
+                            ", not %s: %s",
+                            broker_ids[b], rd_kafka_err2name(err),
+                            rd_kafka_event_error_string(rkev));
+                TEST_ASSERT(rd_kafka_DescribeFeatures_result_node_id(res) ==
+                                broker_ids[b],
+                            "Expected broker %" PRId32
+                            " to answer, got %" PRId32,
+                            broker_ids[b],
+                            rd_kafka_DescribeFeatures_result_node_id(res));
+                rd_kafka_event_destroy(rkev);
+        }
+        free(broker_ids);
+
+        if (!rkqu)
+                rd_kafka_queue_destroy(q);
+
+        SUB_TEST_PASS();
+}
+
+/**
  * @brief Test DescribeCluster for the test cluster.
  *
  * @param include_authorized_operations if true, check authorized operations
@@ -5672,6 +5810,10 @@ static void do_test_apis(rd_kafka_type_t cltype) {
         /* Describe cluster */
         do_test_DescribeCluster("temp queue", rk, NULL, 1500, rd_false);
         do_test_DescribeCluster("main queue", rk, mainq, 1500, rd_false);
+
+        /* Describe features (KIP-584) */
+        do_test_DescribeFeatures("temp queue", rk, NULL, 15000);
+        do_test_DescribeFeatures("main queue", rk, mainq, 15000);
 
         if (test_broker_version >= TEST_BRKVER(2, 3, 0, 0)) {
                 /* Describe topics */

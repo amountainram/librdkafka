@@ -126,6 +126,7 @@ const char *rd_kafka_op2str(rd_kafka_op_type_t type) {
             [RD_KAFKA_OP_ELECTLEADERS] = "REPLY:ELECTLEADERS",
             [RD_KAFKA_OP_DESCRIBETOPICPARTITIONS] =
                 "REPLY:DESCRIBETOPICPARTITIONS",
+            [RD_KAFKA_OP_DESCRIBEFEATURES]   = "REPLY:DESCRIBEFEATURES",
             [RD_KAFKA_OP_SHARE_FETCH]        = "REPLY:SHARE_FETCH",
             [RD_KAFKA_OP_SHARE_FETCH_FANOUT] = "REPLY:SHARE_FETCH_FANOUT",
             [RD_KAFKA_OP_SHARE_SESSION_PARTITION_ADD] =
@@ -310,7 +311,8 @@ rd_kafka_op_t *rd_kafka_op_new0(const char *source, rd_kafka_op_type_t type) {
             [RD_KAFKA_OP_ELECTLEADERS] = sizeof(rko->rko_u.admin_request),
             [RD_KAFKA_OP_DESCRIBETOPICPARTITIONS] =
                 sizeof(rko->rko_u.admin_request),
-            [RD_KAFKA_OP_SHARE_FETCH] = sizeof(rko->rko_u.share_fetch),
+            [RD_KAFKA_OP_DESCRIBEFEATURES] = sizeof(rko->rko_u.admin_request),
+            [RD_KAFKA_OP_SHARE_FETCH]      = sizeof(rko->rko_u.share_fetch),
             [RD_KAFKA_OP_SHARE_FETCH_FANOUT] =
                 sizeof(rko->rko_u.share_fetch_fanout),
             [RD_KAFKA_OP_SHARE_SESSION_PARTITION_ADD]    = _RD_KAFKA_OP_EMPTY,
@@ -483,6 +485,7 @@ void rd_kafka_op_destroy(rd_kafka_op_t *rko) {
         case RD_KAFKA_OP_LISTOFFSETS:
         case RD_KAFKA_OP_ELECTLEADERS:
         case RD_KAFKA_OP_DESCRIBETOPICPARTITIONS:
+        case RD_KAFKA_OP_DESCRIBEFEATURES:
                 rd_kafka_replyq_destroy(&rko->rko_u.admin_request.replyq);
                 rd_list_destroy(&rko->rko_u.admin_request.args);
                 if (rko->rko_u.admin_request.options.match_consumer_group_states

@@ -10424,6 +10424,339 @@ void rd_kafka_DescribeCluster(rd_kafka_t *rk,
 /**@}*/
 
 /**
+ * @name Describe features
+ * @{
+ *
+ *
+ *
+ *
+ */
+
+/** Features per array of an ApiVersion response, at most */
+#define RD_KAFKA_DESCRIBEFEATURES_FEATURES_MAX 1000
+
+static void rd_kafka_FeatureVersionRange_free(void *ptr) {
+        rd_kafka_FeatureVersionRange_t *range = ptr;
+        rd_free(range->name);
+        rd_free(range);
+}
+
+static void rd_kafka_ApiVersionRange_free(void *ptr) {
+        rd_kafka_ApiVersionRange_t *range = ptr;
+        rd_free(range->api_name);
+        rd_free(range);
+}
+
+static int rd_kafka_ApiVersionRange_cmp(const void *_a, const void *_b) {
+        const rd_kafka_ApiVersionRange_t *a = _a, *b = _b;
+        return RD_CMP(a->api_key, b->api_key);
+}
+
+static rd_kafka_FeatureMetadata_t *
+rd_kafka_FeatureMetadata_new(int32_t node_id) {
+        rd_kafka_FeatureMetadata_t *fm = rd_calloc(1, sizeof(*fm));
+
+        fm->node_id                  = node_id;
+        fm->finalized_features_epoch = -1;
+        rd_list_init(&fm->finalized_features, 0,
+                     rd_kafka_FeatureVersionRange_free);
+        rd_list_init(&fm->supported_features, 0,
+                     rd_kafka_FeatureVersionRange_free);
+        rd_list_init(&fm->api_versions, 0, rd_kafka_ApiVersionRange_free);
+        return fm;
+}
+
+static void rd_kafka_FeatureMetadata_free(void *ptr) {
+        rd_kafka_FeatureMetadata_t *fm = ptr;
+        rd_list_destroy(&fm->finalized_features);
+        rd_list_destroy(&fm->supported_features);
+        rd_list_destroy(&fm->api_versions);
+        rd_free(fm);
+}
+
+/**
+ * @brief Reads a SupportedFeatures or FinalizedFeatures array into
+ *        \p features: their versions in the order of the response, the
+ *        finalized ones' MaxVersionLevel first.
+ *
+ * @returns 1 on success, -1 on parse error.
+ */
+static int rd_kafka_DescribeFeatures_read_features(rd_kafka_buf_t *rkbuf,
+                                                   rd_list_t *features,
+                                                   rd_bool_t finalized) {
+        const int log_decode_errors = LOG_ERR;
+        int32_t FeatureCnt;
+        int32_t i;
+
+        rd_kafka_buf_read_arraycnt(rkbuf, &FeatureCnt,
+                                   RD_KAFKA_DESCRIBEFEATURES_FEATURES_MAX);
+        if (FeatureCnt < 0)
+                rd_kafka_buf_parse_fail(rkbuf, "null %s features",
+                                        finalized ? "finalized" : "supported");
+        rd_list_grow(features, (size_t)FeatureCnt);
+
+        for (i = 0; i < FeatureCnt; i++) {
+                rd_kafkap_str_t Name;
+                int16_t First, Second;
+                rd_kafka_FeatureVersionRange_t *range;
+
+                rd_kafka_buf_read_str(rkbuf, &Name);
+                if (RD_KAFKAP_STR_IS_NULL(&Name))
+                        rd_kafka_buf_parse_fail(rkbuf, "null feature name");
+                rd_kafka_buf_read_i16(rkbuf, &First);
+                rd_kafka_buf_read_i16(rkbuf, &Second);
+                rd_kafka_buf_skip_tags(rkbuf);
+
+                range       = rd_calloc(1, sizeof(*range));
+                range->name = RD_KAFKAP_STR_DUP(&Name);
+                if (finalized) {
+                        range->max_version = First;
+                        range->min_version = Second;
+                } else {
+                        range->min_version = First;
+                        range->max_version = Second;
+                }
+                rd_list_add(features, range);
+        }
+
+        return 1;
+
+err_parse:
+        return -1;
+}
+
+/**
+ * @brief Reads the tagged fields of an ApiVersion response (v3+) into
+ *        \p fm.
+ */
+static int
+rd_kafka_DescribeFeatures_reply_tags_parse(rd_kafka_buf_t *rkbuf,
+                                           uint64_t tagtype,
+                                           uint64_t taglen,
+                                           rd_kafka_FeatureMetadata_t *fm) {
+        const int log_decode_errors = LOG_ERR;
+
+        switch (tagtype) {
+        case 0: /* SupportedFeatures */
+                return rd_kafka_DescribeFeatures_read_features(
+                    rkbuf, &fm->supported_features, rd_false);
+        case 1: /* FinalizedFeaturesEpoch */
+                rd_kafka_buf_read_i64(rkbuf, &fm->finalized_features_epoch);
+                return 1;
+        case 2: /* FinalizedFeatures */
+                return rd_kafka_DescribeFeatures_read_features(
+                    rkbuf, &fm->finalized_features, rd_true);
+        default:
+                return 0;
+        }
+
+err_parse:
+        return -1;
+}
+
+/**
+ * @brief Parse an ApiVersion response, for DescribeFeatures, and create the
+ *        ADMIN_RESULT op.
+ */
+static rd_kafka_resp_err_t
+rd_kafka_DescribeFeaturesResponse_parse(rd_kafka_op_t *rko_req,
+                                        rd_kafka_op_t **rko_resultp,
+                                        rd_kafka_buf_t *reply,
+                                        char *errstr,
+                                        size_t errstr_size) {
+        const int log_decode_errors = LOG_ERR;
+        int16_t ApiVersion          = reply->rkbuf_reqhdr.ApiVersion;
+        rd_kafka_op_t *rko_result;
+        rd_kafka_FeatureMetadata_t *fm;
+        int16_t ErrorCode;
+        int32_t ApiArrayCnt;
+        int32_t i;
+
+        /* The result owns everything parsed from now on: destroying it on a
+         * parse failure frees it all. */
+        rko_result = rd_kafka_admin_result_new(rko_req);
+        rd_list_init(&rko_result->rko_u.admin_result.results, 1,
+                     rd_kafka_FeatureMetadata_free);
+        fm = rd_kafka_FeatureMetadata_new(reply->rkbuf_rkb->rkb_nodeid);
+        rd_list_add(&rko_result->rko_u.admin_result.results, fm);
+
+        rd_kafka_buf_read_i16(reply, &ErrorCode);
+        if (ErrorCode) {
+                rd_kafka_op_destroy(rko_result);
+                rd_snprintf(
+                    errstr, errstr_size,
+                    "DescribeFeatures failed: broker %" PRId32 " responded: %s",
+                    reply->rkbuf_rkb->rkb_nodeid, rd_kafka_err2str(ErrorCode));
+                return ErrorCode;
+        }
+
+        rd_kafka_buf_read_arraycnt(reply, &ApiArrayCnt, 1000);
+        if (ApiArrayCnt < 0)
+                rd_kafka_buf_parse_fail(reply, "null ApiKeys");
+        rd_list_grow(&fm->api_versions, (size_t)ApiArrayCnt);
+
+        for (i = 0; i < ApiArrayCnt; i++) {
+                rd_kafka_ApiVersionRange_t *range =
+                    rd_calloc(1, sizeof(*range));
+
+                rd_list_add(&fm->api_versions, range);
+                rd_kafka_buf_read_i16(reply, &range->api_key);
+                rd_kafka_buf_read_i16(reply, &range->min_version);
+                rd_kafka_buf_read_i16(reply, &range->max_version);
+                range->api_name =
+                    rd_strdup(rd_kafka_ApiKey2str(range->api_key));
+                rd_kafka_buf_skip_tags(reply);
+        }
+        rd_list_sort(&fm->api_versions, rd_kafka_ApiVersionRange_cmp);
+
+        if (ApiVersion >= 1)
+                rd_kafka_buf_read_throttle_time(reply);
+
+        rd_kafka_buf_read_tags(reply,
+                               rd_kafka_DescribeFeatures_reply_tags_parse, fm);
+
+        *rko_resultp = rko_result;
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+
+err_parse:
+        rd_kafka_op_destroy(rko_result);
+        rd_snprintf(errstr, errstr_size,
+                    "DescribeFeatures response protocol parse failure: %s",
+                    rd_kafka_err2str(reply->rkbuf_err));
+        return reply->rkbuf_err;
+}
+
+void rd_kafka_DescribeFeatures(rd_kafka_t *rk,
+                               const rd_kafka_AdminOptions_t *options,
+                               rd_kafka_queue_t *rkqu) {
+        rd_kafka_op_t *rko;
+        static const struct rd_kafka_admin_worker_cbs cbs = {
+            rd_kafka_ApiVersionRequest_admin,
+            rd_kafka_DescribeFeaturesResponse_parse};
+
+        rko = rd_kafka_admin_request_op_new(
+            rk, RD_KAFKA_OP_DESCRIBEFEATURES,
+            RD_KAFKA_EVENT_DESCRIBEFEATURES_RESULT, &cbs, options,
+            rkqu->rkqu_q);
+
+        rd_kafka_q_enq(rk->rk_ops, rko);
+}
+
+/**
+ * @returns the DescribeFeatures result's description, or NULL if the
+ *          request failed.
+ */
+static const rd_kafka_FeatureMetadata_t *rd_kafka_DescribeFeatures_result_get(
+    const rd_kafka_DescribeFeatures_result_t *result) {
+        const rd_kafka_op_t *rko = (const rd_kafka_op_t *)result;
+        rd_kafka_op_type_t reqtype =
+            rko->rko_u.admin_result.reqtype & ~RD_KAFKA_OP_FLAGMASK;
+        rd_assert(reqtype == RD_KAFKA_OP_DESCRIBEFEATURES);
+
+        return rd_list_elem(&rko->rko_u.admin_result.results, 0);
+}
+
+int32_t rd_kafka_DescribeFeatures_result_node_id(
+    const rd_kafka_DescribeFeatures_result_t *result) {
+        const rd_kafka_FeatureMetadata_t *fm =
+            rd_kafka_DescribeFeatures_result_get(result);
+        return fm ? fm->node_id : -1;
+}
+
+int64_t rd_kafka_DescribeFeatures_result_finalized_features_epoch(
+    const rd_kafka_DescribeFeatures_result_t *result) {
+        const rd_kafka_FeatureMetadata_t *fm =
+            rd_kafka_DescribeFeatures_result_get(result);
+        return fm ? fm->finalized_features_epoch : -1;
+}
+
+/**
+ * @returns the elements of \p list, \p cntp updated with their count, or
+ *          none (NULL) if the request failed: no \p fm.
+ */
+static const void **
+rd_kafka_DescribeFeatures_result_list(const rd_kafka_FeatureMetadata_t *fm,
+                                      const rd_list_t *list,
+                                      size_t *cntp) {
+        if (!fm) {
+                *cntp = 0;
+                return NULL;
+        }
+        *cntp = rd_list_cnt(list);
+        return (const void **)list->rl_elems;
+}
+
+const rd_kafka_FeatureVersionRange_t **
+rd_kafka_DescribeFeatures_result_finalized_features(
+    const rd_kafka_DescribeFeatures_result_t *result,
+    size_t *cntp) {
+        const rd_kafka_FeatureMetadata_t *fm =
+            rd_kafka_DescribeFeatures_result_get(result);
+        return (const rd_kafka_FeatureVersionRange_t **)
+            rd_kafka_DescribeFeatures_result_list(
+                fm, fm ? &fm->finalized_features : NULL, cntp);
+}
+
+const rd_kafka_FeatureVersionRange_t **
+rd_kafka_DescribeFeatures_result_supported_features(
+    const rd_kafka_DescribeFeatures_result_t *result,
+    size_t *cntp) {
+        const rd_kafka_FeatureMetadata_t *fm =
+            rd_kafka_DescribeFeatures_result_get(result);
+        return (const rd_kafka_FeatureVersionRange_t **)
+            rd_kafka_DescribeFeatures_result_list(
+                fm, fm ? &fm->supported_features : NULL, cntp);
+}
+
+const rd_kafka_ApiVersionRange_t **
+rd_kafka_DescribeFeatures_result_api_versions(
+    const rd_kafka_DescribeFeatures_result_t *result,
+    size_t *cntp) {
+        const rd_kafka_FeatureMetadata_t *fm =
+            rd_kafka_DescribeFeatures_result_get(result);
+        return (const rd_kafka_ApiVersionRange_t **)
+            rd_kafka_DescribeFeatures_result_list(
+                fm, fm ? &fm->api_versions : NULL, cntp);
+}
+
+const char *
+rd_kafka_FeatureVersionRange_name(const rd_kafka_FeatureVersionRange_t *range) {
+        return range->name;
+}
+
+int16_t rd_kafka_FeatureVersionRange_min_version(
+    const rd_kafka_FeatureVersionRange_t *range) {
+        return range->min_version;
+}
+
+int16_t rd_kafka_FeatureVersionRange_max_version(
+    const rd_kafka_FeatureVersionRange_t *range) {
+        return range->max_version;
+}
+
+int16_t
+rd_kafka_ApiVersionRange_api_key(const rd_kafka_ApiVersionRange_t *range) {
+        return range->api_key;
+}
+
+const char *
+rd_kafka_ApiVersionRange_api_name(const rd_kafka_ApiVersionRange_t *range) {
+        return range->api_name;
+}
+
+int16_t
+rd_kafka_ApiVersionRange_min_version(const rd_kafka_ApiVersionRange_t *range) {
+        return range->min_version;
+}
+
+int16_t
+rd_kafka_ApiVersionRange_max_version(const rd_kafka_ApiVersionRange_t *range) {
+        return range->max_version;
+}
+
+/**@}*/
+
+/**
  * @name ElectLeaders
  * @{
  *
@@ -11393,12 +11726,350 @@ static int ut_DescribeTopicPartitions(void) {
         return fails;
 }
 
+/**
+ * @brief DescribeFeatures unit tests
+ *
+ * @{
+ */
+
+/**
+ * @brief The ways an ApiVersion response is written, for the parser.
+ */
+typedef enum {
+        UT_DF_OK,                /**< Well-formed */
+        UT_DF_NULL_FEATURE_NAME, /**< A null feature name */
+        UT_DF_FEATURES_OVER_CAP, /**< Too many features */
+        UT_DF_NULL_FEATURES,     /**< A null features array */
+        UT_DF_TRUNCATED_FEATURE, /**< Truncated in a feature */
+} ut_DescribeFeatures_case_t;
+
+/**
+ * @brief A DescribeFeatures request op, as the parser gets it.
+ */
+static rd_kafka_op_t *ut_make_DescribeFeatures_request(rd_kafka_t *rk,
+                                                       rd_kafka_q_t *rkq) {
+        static const struct rd_kafka_admin_worker_cbs cbs = {
+            rd_kafka_ApiVersionRequest_admin,
+            rd_kafka_DescribeFeaturesResponse_parse,
+        };
+
+        return rd_kafka_admin_request_op_new(
+            rk, RD_KAFKA_OP_DESCRIBEFEATURES,
+            RD_KAFKA_EVENT_DESCRIBEFEATURES_RESULT, &cbs, NULL, rkq);
+}
+
+/**
+ * @brief A response buffer from \p rkb to an ApiVersion request of version
+ *        \p ApiVersion, to write a response in.
+ */
+static rd_kafka_buf_t *ut_DescribeFeatures_response(rd_kafka_broker_t *rkb,
+                                                    int16_t ApiVersion) {
+        rd_kafka_buf_t *rkbuf = rd_kafka_buf_new(0, 0);
+
+        /* Released when the buffer is destroyed */
+        rd_kafka_broker_keep(rkb);
+        rkbuf->rkbuf_rkb               = rkb;
+        rkbuf->rkbuf_reqhdr.ApiKey     = RD_KAFKAP_ApiVersion;
+        rkbuf->rkbuf_reqhdr.ApiVersion = ApiVersion;
+        if (ApiVersion >= 3)
+                rkbuf->rkbuf_flags |= RD_KAFKA_OP_F_FLEXVER;
+        return rkbuf;
+}
+
+/**
+ * @brief Writes the ApiKeys: Metadata, then Produce, out of order.
+ */
+static void ut_write_DescribeFeatures_ApiKeys(rd_kafka_buf_t *rkbuf) {
+        rd_kafka_buf_write_i16(rkbuf, 0); /* ErrorCode */
+        rd_kafka_buf_write_arraycnt(rkbuf, 2);
+        rd_kafka_buf_write_i16(rkbuf, RD_KAFKAP_Metadata);
+        rd_kafka_buf_write_i16(rkbuf, 0);
+        rd_kafka_buf_write_i16(rkbuf, 12);
+        rd_kafka_buf_write_tags_empty(rkbuf);
+        rd_kafka_buf_write_i16(rkbuf, RD_KAFKAP_Produce);
+        rd_kafka_buf_write_i16(rkbuf, 3);
+        rd_kafka_buf_write_i16(rkbuf, 11);
+        rd_kafka_buf_write_tags_empty(rkbuf);
+}
+
+/**
+ * @brief Writes the value of tagged field \p tagtype of an ApiVersion
+ *        response, as \p c says.
+ */
+static void ut_write_DescribeFeatures_tag(rd_kafka_buf_t *rkbuf,
+                                          int tagtype,
+                                          ut_DescribeFeatures_case_t c) {
+        switch (tagtype) {
+        case 0: /* SupportedFeatures */
+                if (c == UT_DF_NULL_FEATURES) {
+                        rd_kafka_buf_write_arraycnt(rkbuf, -1);
+                        break;
+                }
+                if (c == UT_DF_FEATURES_OVER_CAP) {
+                        rd_kafka_buf_write_arraycnt(
+                            rkbuf, RD_KAFKA_DESCRIBEFEATURES_FEATURES_MAX + 1);
+                        break;
+                }
+                rd_kafka_buf_write_arraycnt(rkbuf, 2);
+                rd_kafka_buf_write_str(rkbuf, "metadata.version", -1);
+                rd_kafka_buf_write_i16(rkbuf, 1);
+                rd_kafka_buf_write_i16(rkbuf, 27);
+                rd_kafka_buf_write_tags_empty(rkbuf);
+                rd_kafka_buf_write_str(
+                    rkbuf,
+                    c == UT_DF_NULL_FEATURE_NAME ? NULL : "group.version", -1);
+                rd_kafka_buf_write_i16(rkbuf, 0);
+                if (c == UT_DF_TRUNCATED_FEATURE)
+                        break;
+                rd_kafka_buf_write_i16(rkbuf, 1);
+                rd_kafka_buf_write_tags_empty(rkbuf);
+                break;
+        case 1: /* FinalizedFeaturesEpoch */
+                rd_kafka_buf_write_i64(rkbuf, 42);
+                break;
+        case 2: /* FinalizedFeatures: MaxVersionLevel first */
+                rd_kafka_buf_write_arraycnt(rkbuf, 1);
+                rd_kafka_buf_write_str(rkbuf, "metadata.version", -1);
+                rd_kafka_buf_write_i16(rkbuf, 21);
+                rd_kafka_buf_write_i16(rkbuf, 1);
+                rd_kafka_buf_write_tags_empty(rkbuf);
+                break;
+        case 3: /* ZkMigrationReady: unknown to the parser */
+                rd_kafka_buf_write_bool(rkbuf, rd_false);
+                break;
+        }
+}
+
+/**
+ * @brief Parses \p reply for \p rko_req: returns the error, and the result
+ *        in \p rko_resultp.
+ */
+static rd_kafka_resp_err_t
+ut_parse_DescribeFeatures(rd_kafka_op_t *rko_req,
+                          rd_kafka_buf_t *reply,
+                          rd_kafka_op_t **rko_resultp) {
+        char errstr[512];
+
+        rd_slice_init_full(&reply->rkbuf_reader, &reply->rkbuf_buf);
+        *rko_resultp = NULL;
+        return rd_kafka_DescribeFeaturesResponse_parse(
+            rko_req, rko_resultp, reply, errstr, sizeof(errstr));
+}
+
+/**
+ * @brief Parsing a v4 response, with features.
+ */
+static int ut_DescribeFeatures_parse(rd_kafka_t *rk,
+                                     rd_kafka_q_t *rkq,
+                                     rd_kafka_broker_t *rkb) {
+        static const int tags[] = {0, 1, 2, 3};
+        const rd_kafka_DescribeFeatures_result_t *result;
+        const rd_kafka_FeatureVersionRange_t **features;
+        const rd_kafka_ApiVersionRange_t **apis;
+        rd_kafka_op_t *rko_req, *rko_result;
+        rd_kafka_buf_t *reply;
+        rd_kafka_resp_err_t err;
+        size_t cnt;
+
+        RD_UT_SAY("DescribeFeatures: a v4 response with features");
+
+        rko_req = ut_make_DescribeFeatures_request(rk, rkq);
+        reply   = ut_DescribeFeatures_response(rkb, 4);
+        ut_write_DescribeFeatures_ApiKeys(reply);
+        rd_kafka_buf_write_i32(reply, 0); /* ThrottleTimeMs */
+        rd_kafka_buf_write_tags(reply, ut_write_DescribeFeatures_tag, tags,
+                                RD_ARRAYSIZE(tags), UT_DF_OK);
+
+        err = ut_parse_DescribeFeatures(rko_req, reply, &rko_result);
+        RD_UT_ASSERT(!err, "parse failed: %s", rd_kafka_err2str(err));
+        result = (const rd_kafka_DescribeFeatures_result_t *)rko_result;
+
+        RD_UT_ASSERT(rd_kafka_DescribeFeatures_result_node_id(result) == -1,
+                     "expected the logical broker's id -1");
+        RD_UT_ASSERT(rd_kafka_DescribeFeatures_result_finalized_features_epoch(
+                         result) == 42,
+                     "expected epoch 42");
+
+        apis = rd_kafka_DescribeFeatures_result_api_versions(result, &cnt);
+        RD_UT_ASSERT(cnt == 2, "expected 2 APIs, got %" PRIusz, cnt);
+        RD_UT_ASSERT(rd_kafka_ApiVersionRange_api_key(apis[0]) ==
+                             RD_KAFKAP_Produce &&
+                         !strcmp(rd_kafka_ApiVersionRange_api_name(apis[0]),
+                                 "Produce") &&
+                         rd_kafka_ApiVersionRange_min_version(apis[0]) == 3 &&
+                         rd_kafka_ApiVersionRange_max_version(apis[0]) == 11,
+                     "expected Produce 3..11 first");
+        RD_UT_ASSERT(rd_kafka_ApiVersionRange_api_key(apis[1]) ==
+                         RD_KAFKAP_Metadata,
+                     "expected Metadata second");
+
+        features =
+            rd_kafka_DescribeFeatures_result_supported_features(result, &cnt);
+        RD_UT_ASSERT(cnt == 2, "expected 2 supported features, got %" PRIusz,
+                     cnt);
+        RD_UT_ASSERT(
+            !strcmp(rd_kafka_FeatureVersionRange_name(features[1]),
+                    "group.version") &&
+                rd_kafka_FeatureVersionRange_min_version(features[1]) == 0 &&
+                rd_kafka_FeatureVersionRange_max_version(features[1]) == 1,
+            "expected group.version 0..1");
+
+        features =
+            rd_kafka_DescribeFeatures_result_finalized_features(result, &cnt);
+        RD_UT_ASSERT(cnt == 1, "expected 1 finalized feature, got %" PRIusz,
+                     cnt);
+        RD_UT_ASSERT(
+            !strcmp(rd_kafka_FeatureVersionRange_name(features[0]),
+                    "metadata.version") &&
+                rd_kafka_FeatureVersionRange_min_version(features[0]) == 1 &&
+                rd_kafka_FeatureVersionRange_max_version(features[0]) == 21,
+            "expected metadata.version finalized at 1..21");
+
+        rd_kafka_op_destroy(rko_result);
+        rd_kafka_op_destroy(rko_req);
+        rd_kafka_buf_destroy(reply);
+        RD_UT_PASS();
+}
+
+/**
+ * @brief Parsing a v0 response: API versions only.
+ */
+static int ut_DescribeFeatures_parse_v0(rd_kafka_t *rk,
+                                        rd_kafka_q_t *rkq,
+                                        rd_kafka_broker_t *rkb) {
+        const rd_kafka_DescribeFeatures_result_t *result;
+        rd_kafka_op_t *rko_req, *rko_result;
+        rd_kafka_buf_t *reply;
+        rd_kafka_resp_err_t err;
+        size_t cnt;
+
+        RD_UT_SAY("DescribeFeatures: a v0 response, without features");
+
+        rko_req = ut_make_DescribeFeatures_request(rk, rkq);
+        reply   = ut_DescribeFeatures_response(rkb, 0);
+        ut_write_DescribeFeatures_ApiKeys(reply);
+
+        err = ut_parse_DescribeFeatures(rko_req, reply, &rko_result);
+        RD_UT_ASSERT(!err, "parse failed: %s", rd_kafka_err2str(err));
+        result = (const rd_kafka_DescribeFeatures_result_t *)rko_result;
+
+        rd_kafka_DescribeFeatures_result_api_versions(result, &cnt);
+        RD_UT_ASSERT(cnt == 2, "expected 2 APIs, got %" PRIusz, cnt);
+        rd_kafka_DescribeFeatures_result_supported_features(result, &cnt);
+        RD_UT_ASSERT(cnt == 0, "expected no supported features");
+        rd_kafka_DescribeFeatures_result_finalized_features(result, &cnt);
+        RD_UT_ASSERT(cnt == 0, "expected no finalized features");
+        RD_UT_ASSERT(rd_kafka_DescribeFeatures_result_finalized_features_epoch(
+                         result) == -1,
+                     "expected an unknown epoch");
+
+        rd_kafka_op_destroy(rko_result);
+        rd_kafka_op_destroy(rko_req);
+        rd_kafka_buf_destroy(reply);
+        RD_UT_PASS();
+}
+
+/**
+ * @brief Error responses and malformed ones are rejected, without crash nor
+ *        leak (#5580).
+ */
+static int ut_DescribeFeatures_parse_errors(rd_kafka_t *rk,
+                                            rd_kafka_q_t *rkq,
+                                            rd_kafka_broker_t *rkb) {
+        static const char *cases[] = {
+            "ErrorCode CLUSTER_AUTHORIZATION_FAILED",
+            "null ApiKeys",
+            "ApiKeys over the cap",
+            "truncated in an ApiKey",
+            "a null feature name",
+            "features over the cap",
+            "null features",
+            "truncated in a feature",
+        };
+        static const int tags[] = {0};
+        size_t c;
+
+        for (c = 0; c < RD_ARRAYSIZE(cases); c++) {
+                rd_kafka_op_t *rko_req, *rko_result;
+                rd_kafka_buf_t *reply;
+                rd_kafka_resp_err_t err;
+
+                RD_UT_SAY("DescribeFeatures: rejects %s", cases[c]);
+
+                rko_req = ut_make_DescribeFeatures_request(rk, rkq);
+                reply   = ut_DescribeFeatures_response(rkb, 4);
+
+                switch (c) {
+                case 0:
+                        rd_kafka_buf_write_i16(
+                            reply,
+                            RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED);
+                        rd_kafka_buf_write_arraycnt(reply, 0);
+                        rd_kafka_buf_write_i32(reply, 0);
+                        rd_kafka_buf_write_tags_empty(reply);
+                        break;
+                case 1:
+                        rd_kafka_buf_write_i16(reply, 0);
+                        rd_kafka_buf_write_arraycnt(reply, -1);
+                        break;
+                case 2:
+                        rd_kafka_buf_write_i16(reply, 0);
+                        rd_kafka_buf_write_arraycnt(reply, 1001);
+                        break;
+                case 3:
+                        rd_kafka_buf_write_i16(reply, 0);
+                        rd_kafka_buf_write_arraycnt(reply, 1);
+                        rd_kafka_buf_write_i16(reply, RD_KAFKAP_Produce);
+                        break;
+                default:
+                        ut_write_DescribeFeatures_ApiKeys(reply);
+                        rd_kafka_buf_write_i32(reply, 0); /* ThrottleTimeMs */
+                        rd_kafka_buf_write_tags(
+                            reply, ut_write_DescribeFeatures_tag, tags,
+                            RD_ARRAYSIZE(tags),
+                            (ut_DescribeFeatures_case_t)(c - 3));
+                        break;
+                }
+
+                err = ut_parse_DescribeFeatures(rko_req, reply, &rko_result);
+                RD_UT_ASSERT(err, "%s: expected a failure", cases[c]);
+                RD_UT_ASSERT(
+                    c != 0 ||
+                        err == RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED,
+                    "%s: expected the broker's error, got %s", cases[c],
+                    rd_kafka_err2name(err));
+                RD_UT_ASSERT(!rko_result, "%s: expected no result", cases[c]);
+
+                rd_kafka_op_destroy(rko_req);
+                rd_kafka_buf_destroy(reply);
+        }
+
+        RD_UT_PASS();
+}
+
+static int ut_DescribeFeatures(void) {
+        rd_kafka_t *rk         = rd_kafka_new(RD_KAFKA_PRODUCER, NULL, NULL, 0);
+        rd_kafka_q_t *rkq      = rd_kafka_q_new(rk);
+        rd_kafka_broker_t *rkb = rd_kafka_broker_add_logical(rk, "unittest");
+        int fails              = 0;
+
+        fails += ut_DescribeFeatures_parse(rk, rkq, rkb);
+        fails += ut_DescribeFeatures_parse_v0(rk, rkq, rkb);
+        fails += ut_DescribeFeatures_parse_errors(rk, rkq, rkb);
+
+        rd_kafka_broker_destroy(rkb); /* add_logical()'s reference */
+        rd_kafka_q_destroy_owner(rkq);
+        rd_kafka_destroy(rk);
+        return fails;
+}
+
 /**@}*/
 
 int unittest_admin(void) {
         int fails = 0;
         fails += ut_ListConsumerGroups_response_merge();
         fails += ut_DescribeTopicPartitions();
+        fails += ut_DescribeFeatures();
         return fails;
 }
 

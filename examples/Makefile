@@ -11,6 +11,7 @@ EXAMPLES ?= rdkafka_example rdkafka_performance rdkafka_example_cpp \
 	describe_topics \
 	describe_topic_partitions \
 	describe_cluster \
+	describe_features \
 	list_consumer_group_offsets \
 	alter_consumer_group_offsets \
 	incremental_alter_configs \
@@ -110,6 +111,10 @@ describe_topic_partitions: ../src/librdkafka.a describe_topic_partitions.c
 		../src/librdkafka.a $(LIBS)
 
 describe_cluster: ../src/librdkafka.a describe_cluster.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $@.c -o $@ $(LDFLAGS) \
+		../src/librdkafka.a $(LIBS)
+
+describe_features: ../src/librdkafka.a describe_features.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $@.c -o $@ $(LDFLAGS) \
 		../src/librdkafka.a $(LIBS)
 

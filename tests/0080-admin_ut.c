@@ -1120,6 +1120,110 @@ static void do_test_DescribeCluster(const char *what,
         SUB_TEST_PASS();
 }
 
+/**
+ * @brief DescribeFeatures tests
+ *
+ *
+ *
+ */
+static void do_test_DescribeFeatures(const char *what,
+                                     rd_kafka_t *rk,
+                                     rd_kafka_queue_t *useq,
+                                     int with_options) {
+        rd_kafka_queue_t *q;
+        rd_kafka_AdminOptions_t *options = NULL;
+        int exp_timeout                  = MY_SOCKET_TIMEOUT_MS;
+        char errstr[512];
+        const char *errstr2;
+        rd_kafka_resp_err_t err;
+        test_timing_t timing;
+        rd_kafka_event_t *rkev;
+        const rd_kafka_DescribeFeatures_result_t *res;
+        void *my_opaque = NULL, *opaque;
+        size_t cnt;
+
+        SUB_TEST_QUICK("%s DescribeFeatures with %s, timeout %dms",
+                       rd_kafka_name(rk), what, exp_timeout);
+
+        q = useq ? useq : rd_kafka_queue_new(rk);
+
+        if (with_options) {
+                options = rd_kafka_AdminOptions_new(
+                    rk, RD_KAFKA_ADMIN_OP_DESCRIBEFEATURES);
+
+                exp_timeout = MY_SOCKET_TIMEOUT_MS * 2;
+                err         = rd_kafka_AdminOptions_set_request_timeout(
+                    options, exp_timeout, errstr, sizeof(errstr));
+                TEST_ASSERT(!err, "%s", rd_kafka_err2str(err));
+                err = rd_kafka_AdminOptions_set_broker(options, 2, errstr,
+                                                       sizeof(errstr));
+                TEST_ASSERT(!err, "%s", rd_kafka_err2str(err));
+
+                if (useq) {
+                        my_opaque = (void *)789;
+                        rd_kafka_AdminOptions_set_opaque(options, my_opaque);
+                }
+        }
+
+        TIMING_START(&timing, "DescribeFeatures");
+        TEST_SAY("Call DescribeFeatures, timeout is %dms\n", exp_timeout);
+        rd_kafka_DescribeFeatures(rk, options, q);
+        TIMING_ASSERT_LATER(&timing, 0, 50);
+
+        /* Poll result queue */
+        TIMING_START(&timing, "DescribeFeatures.queue_poll");
+        rkev = rd_kafka_queue_poll(q, exp_timeout + 1000);
+        TIMING_ASSERT_LATER(&timing, exp_timeout - 100, exp_timeout + 100);
+        TEST_ASSERT(rkev != NULL, "expected result in %dms", exp_timeout);
+        TEST_SAY("DescribeFeatures: got %s in %.3fs\n",
+                 rd_kafka_event_name(rkev), TIMING_DURATION(&timing) / 1000.0f);
+
+        /* Convert event to proper result */
+        res = rd_kafka_event_DescribeFeatures_result(rkev);
+        TEST_ASSERT(res, "expected DescribeFeatures_result, not %s",
+                    rd_kafka_event_name(rkev));
+
+        opaque = rd_kafka_event_opaque(rkev);
+        TEST_ASSERT(opaque == my_opaque, "expected opaque to be %p, not %p",
+                    my_opaque, opaque);
+
+        /* Expecting error (Fail while waiting for controller, or broker 2) */
+        err     = rd_kafka_event_error(rkev);
+        errstr2 = rd_kafka_event_error_string(rkev);
+        TEST_ASSERT(err == RD_KAFKA_RESP_ERR__TIMED_OUT,
+                    "expected DescribeFeatures to return error %s, not %s (%s)",
+                    rd_kafka_err2str(RD_KAFKA_RESP_ERR__TIMED_OUT),
+                    rd_kafka_err2str(err), err ? errstr2 : "n/a");
+
+        /* A failed request has no result */
+        TEST_ASSERT(rd_kafka_DescribeFeatures_result_node_id(res) == -1,
+                    "expected no node id");
+        TEST_ASSERT(rd_kafka_DescribeFeatures_result_finalized_features_epoch(
+                        res) == -1,
+                    "expected an unknown epoch");
+        TEST_ASSERT(
+            !rd_kafka_DescribeFeatures_result_finalized_features(res, &cnt) &&
+                cnt == 0,
+            "expected no finalized features");
+        TEST_ASSERT(
+            !rd_kafka_DescribeFeatures_result_supported_features(res, &cnt) &&
+                cnt == 0,
+            "expected no supported features");
+        TEST_ASSERT(!rd_kafka_DescribeFeatures_result_api_versions(res, &cnt) &&
+                        cnt == 0,
+                    "expected no API versions");
+
+        rd_kafka_event_destroy(rkev);
+
+        if (options)
+                rd_kafka_AdminOptions_destroy(options);
+
+        if (!useq)
+                rd_kafka_queue_destroy(q);
+
+        SUB_TEST_PASS();
+}
+
 static void do_test_DeleteRecords(const char *what,
                                   rd_kafka_t *rk,
                                   rd_kafka_queue_t *useq,
@@ -3114,6 +3218,10 @@ static void do_test_apis(rd_kafka_type_t cltype) {
         do_test_DescribeCluster("temp queue, no options", rk, NULL, 0);
         do_test_DescribeCluster("temp queue, options", rk, NULL, 1);
         do_test_DescribeCluster("main queue, options", rk, mainq, 1);
+
+        do_test_DescribeFeatures("temp queue, no options", rk, NULL, 0);
+        do_test_DescribeFeatures("temp queue, options", rk, NULL, 1);
+        do_test_DescribeFeatures("main queue, options", rk, mainq, 1);
 
         do_test_DeleteGroups("temp queue, no options", rk, NULL, 0, rd_false);
         do_test_DeleteGroups("temp queue, options", rk, NULL, 1, rd_false);

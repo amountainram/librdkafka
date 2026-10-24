@@ -2611,7 +2611,7 @@ The [Apache Kafka Implementation Proposals (KIPs)](https://cwiki.apache.org/conf
 | KIP-568 - Explicit rebalance triggering on the Consumer                  | 2.6.0                       | Not supported                                                                                 |
 | KIP-659 - Add metadata to DescribeConfigsResponse                        | 2.6.0                       | Not supported                                                                                 |
 | KIP-580 - Exponential backoff for Kafka clients                          | 3.7.0                       | Supported                                                                                     |
-| KIP-584 - Versioning scheme for features                                 | WIP                         | Not supported                                                                                 |
+| KIP-584 - Versioning scheme for features                                 | 2.7.0                       | Partially Supported (AdminAPI: DescribeFeatures)                                              |
 | KIP-588 - Allow producers to recover gracefully from txn timeouts        | 2.8.0 (WIP)                 | Not supported                                                                                 |
 | KIP-601 - Configurable socket connection timeout                         | 2.7.0                       | Supported                                                                                     |
 | KIP-602 - Use all resolved addresses by default                          | 2.6.0                       | Supported                                                                                     |
@@ -2657,7 +2657,7 @@ release of librdkafka.
 | 15     | DescribeGroups               | 6         | 5              |
 | 16     | ListGroups                   | 5         | 4              |
 | 17     | SaslHandshake                | 1         | 1              |
-| 18     | ApiVersions                  | 4         | 3              |
+| 18     | ApiVersions                  | 4         | 4              |
 | 19     | CreateTopics                 | 7         | 4              |
 | 20     | DeleteTopics                 | 6         | 4              |
 | 21     | DeleteRecords                | 2         | 2              |

@@ -50,6 +50,8 @@ For more complex uses, see:
    topics, or all of them, and their partitions with DescribeTopicPartitions
    (KIP-966).
  * [describe_cluster.c](describe_cluster.c) - Describe cluster.
+ * [describe_features.c](describe_features.c) - Describe the features of the
+   cluster (KIP-584), and the API versions of a broker.
  * [list_consumer_group_offsets.c](list_consumer_group_offsets.c) - List offsets of a consumer group.
  * [alter_consumer_group_offsets.c](alter_consumer_group_offsets.c) - Alter offsets of a consumer group.
  * [incremental_alter_configs.c](incremental_alter_configs.c) - Incrementally alter resource configurations.

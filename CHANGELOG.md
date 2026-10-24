@@ -11,6 +11,16 @@
   returns every topic at once. Partitions also report their leader epoch,
   eligible leader replicas, last known eligible leader replicas, and offline
   replicas, through new `rd_kafka_TopicPartitionInfo_*()` accessors.
+* [KIP-584](https://cwiki.apache.org/confluence/display/KAFKA/KIP-584%3A+Versioning+scheme+for+features)
+  AdminAPI: `rd_kafka_DescribeFeatures()` describes the features of the
+  cluster with an ApiVersions request, as Java's `Admin.describeFeatures()`:
+  those finalized cluster-wide, e.g. the `metadata.version` the cluster runs
+  at, with their epoch, and those the broker answering supports, the
+  controller or the one set with `rd_kafka_AdminOptions_set_broker()`. The
+  result also has the broker's protocol API versions. Brokers before 2.4.0
+  report API versions only; supported features with a minimum version of 0
+  need ApiVersions v4 (broker 3.9.0+). The mock cluster answers ApiVersions
+  up to v4 and reports the features set with `rd_kafka_mock_set_feature()`.
 
 
 ## Fixes

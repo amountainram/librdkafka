@@ -192,6 +192,9 @@ typedef enum {
         RD_KAFKA_OP_DESCRIBETOPICPARTITIONS, /**< Admin:
                                               *   DescribeTopicPartitions
                                               *   u.admin_request */
+        RD_KAFKA_OP_DESCRIBEFEATURES,        /**< Admin:
+                                              *   DescribeFeatures
+                                              *   u.admin_request */
         RD_KAFKA_OP_SHARE_FETCH, /**< broker op: Issue share fetch request if
                                     applicable. */
         RD_KAFKA_OP_SHARE_FETCH_FANOUT, /**< fanout share fetch operation */
@@ -631,6 +634,7 @@ struct rd_kafka_op_s {
                                 RD_KAFKA_MOCK_CMD_APIVERSION_SET,
                                 RD_KAFKA_MOCK_CMD_REQUESTED_METRICS_SET,
                                 RD_KAFKA_MOCK_CMD_TELEMETRY_PUSH_INTERVAL_SET,
+                                RD_KAFKA_MOCK_CMD_FEATURE_SET,
                         } cmd;
 
                         rd_kafka_resp_err_t err;   /**< Error for:
@@ -643,6 +647,7 @@ struct rd_kafka_op_s {
                                                     *    BROKER_SET_RACK
                                                     *    COORD_SET (key_type)
                                                     *    PART_PUSH_LEADER_RESPONSE
+                                                    *    FEATURE_SET
                                                     */
                         char *str;                 /**< For:
                                                     *    COORD_SET (key)
@@ -652,6 +657,8 @@ struct rd_kafka_op_s {
                                                     *    PART_SET_FOLLOWER_WMARKS
                                                     *    PART_SET_LEADER
                                                     *    APIVERSION_SET (ApiKey)
+                                                    *    FEATURE_SET (finalized
+                                                    *      level, or -1)
                                                     *    PART_PUSH_LEADER_RESPONSE
                                                     */
                         int32_t broker_id;         /**< For:
@@ -667,6 +674,7 @@ struct rd_kafka_op_s {
                                                     *    PART_SET_FOLLOWER_WMARKS
                                                     *    BROKER_SET_UPDOWN
                                                     *    APIVERSION_SET (minver)
+                                                    *    FEATURE_SET (minver)
                                                     *    BROKER_SET_RTT
                                                     *    PART_DELETE_RECORDS
                                                     *      (before_offset)
@@ -675,6 +683,7 @@ struct rd_kafka_op_s {
                                                     *    TOPIC_CREATE (repl fact)
                                                     *    PART_SET_FOLLOWER_WMARKS
                                                     *    APIVERSION_SET (maxver)
+                                                    *    FEATURE_SET (maxver)
                                                     *    REQUESTED_METRICS_SET (metrics_cnt)
                                                     *    TELEMETRY_PUSH_INTERVAL_SET (interval)
                                                     */

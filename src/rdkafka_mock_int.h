@@ -584,6 +584,16 @@ extern const struct rd_kafka_mock_api_handler
 
 
 /**
+ * @struct A feature (KIP-584) the mock brokers support, maybe finalized.
+ */
+typedef struct rd_kafka_mock_feature_s {
+        char *name;              /**< Feature name. */
+        int16_t min_version;     /**< Minimum supported version. */
+        int16_t max_version;     /**< Maximum supported version. */
+        int16_t finalized_level; /**< Finalized version level, or -1. */
+} rd_kafka_mock_feature_t;
+
+/**
  * @struct Mock cluster.
  *
  * The cluster IO loop runs in a separate thread where all
@@ -698,6 +708,13 @@ struct rd_kafka_mock_cluster_s {
 
         /** Telemetry push interval ms. Default is 5 min */
         int64_t telemetry_push_interval_ms;
+
+        /** Features (KIP-584) in ApiVersion responses,
+         *  rd_kafka_mock_feature_t*. */
+        rd_list_t features;
+
+        /** Epoch of the finalized features: -1 until one is finalized. */
+        int64_t finalized_features_epoch;
 
         /**< Appends the requests received to mock cluster if set to true,
          *   defaulted to false for less memory usage. */

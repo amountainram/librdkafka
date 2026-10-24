@@ -6721,6 +6721,8 @@ typedef int rd_kafka_event_type_t;
 #define RD_KAFKA_EVENT_ELECTLEADERS_RESULT 0x800000
 /** DescribeTopicPartitions_result_t */
 #define RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT 0x1000000
+/** DescribeFeatures_result_t */
+#define RD_KAFKA_EVENT_DESCRIBEFEATURES_RESULT 0x2000000
 
 /**
  * @returns the event type for the given event.
@@ -6881,6 +6883,7 @@ int rd_kafka_event_error_is_fatal(rd_kafka_event_t *rkev);
  *  - RD_KAFKA_EVENT_LISTOFFSETS_RESULT
  *  - RD_KAFKA_EVENT_ELECTLEADERS_RESULT
  *  - RD_KAFKA_EVENT_DESCRIBETOPICPARTITIONS_RESULT
+ *  - RD_KAFKA_EVENT_DESCRIBEFEATURES_RESULT
  */
 RD_EXPORT
 void *rd_kafka_event_opaque(rd_kafka_event_t *rkev);
@@ -7008,6 +7011,8 @@ typedef rd_kafka_event_t rd_kafka_ListOffsets_result_t;
 typedef rd_kafka_event_t rd_kafka_ElectLeaders_result_t;
 /*! DescribeTopicPartitions result type */
 typedef rd_kafka_event_t rd_kafka_DescribeTopicPartitions_result_t;
+/*! DescribeFeatures result type */
+typedef rd_kafka_event_t rd_kafka_DescribeFeatures_result_t;
 
 /**
  * @brief Get CreateTopics result.
@@ -7309,6 +7314,21 @@ rd_kafka_event_ElectLeaders_result(rd_kafka_event_t *rkev);
  */
 RD_EXPORT const rd_kafka_DescribeTopicPartitions_result_t *
 rd_kafka_event_DescribeTopicPartitions_result(rd_kafka_event_t *rkev);
+
+/**
+ * @brief Get DescribeFeatures result.
+ *
+ * @returns the result of a DescribeFeatures request, or NULL if
+ *          event is of different type.
+ *
+ * @remark The lifetime of the returned memory is the same
+ *         as the lifetime of the \p rkev object.
+ *
+ * Event types:
+ *  RD_KAFKA_EVENT_DESCRIBEFEATURES_RESULT
+ */
+RD_EXPORT const rd_kafka_DescribeFeatures_result_t *
+rd_kafka_event_DescribeFeatures_result(rd_kafka_event_t *rkev);
 
 /**
  * @brief Poll a queue for an event for max \p timeout_ms.
@@ -8249,7 +8269,8 @@ typedef enum rd_kafka_admin_op_t {
         RD_KAFKA_ADMIN_OP_ELECTLEADERS,    /**< ElectLeaders */
         /** DescribeTopicPartitions */
         RD_KAFKA_ADMIN_OP_DESCRIBETOPICPARTITIONS,
-        RD_KAFKA_ADMIN_OP__CNT /**< Number of ops defined */
+        RD_KAFKA_ADMIN_OP_DESCRIBEFEATURES, /**< DescribeFeatures */
+        RD_KAFKA_ADMIN_OP__CNT              /**< Number of ops defined */
 } rd_kafka_admin_op_t;
 
 /**
@@ -9906,6 +9927,214 @@ const rd_kafka_Node_t *rd_kafka_DescribeCluster_result_controller(
 RD_EXPORT
 const char *rd_kafka_DescribeCluster_result_cluster_id(
     const rd_kafka_DescribeCluster_result_t *result);
+
+/**@}*/
+
+/**
+ * @name Admin API - DescribeFeatures
+ * @{
+ */
+
+/**
+ * @brief A feature and a range of its versions: supported by a broker, or
+ *        finalized cluster-wide (KIP-584).
+ */
+typedef struct rd_kafka_FeatureVersionRange_s rd_kafka_FeatureVersionRange_t;
+
+/**
+ * @brief A Kafka protocol API and the range of its versions a broker
+ *        supports.
+ */
+typedef struct rd_kafka_ApiVersionRange_s rd_kafka_ApiVersionRange_t;
+
+/**
+ * @brief Describes the features of the cluster (KIP-584), and the protocol
+ *        API versions of the broker answering, with an ApiVersions request.
+ *
+ * The finalized features are the versions the cluster runs at, e.g.
+ * \c metadata.version, which tells the Apache Kafka release the cluster is
+ * finalized at. The supported features and API versions are those of the
+ * broker answering: the controller by default, any broker with
+ * rd_kafka_AdminOptions_set_broker().
+ *
+ * @param rk Client instance.
+ * @param options Optional admin options, or NULL for defaults.
+ *                Valid options:
+ *                 - request_timeout
+ *                 - broker
+ * @param rkqu Queue to emit result on.
+ *
+ * @remark The result event type emitted on the supplied queue is of type
+ *         \c RD_KAFKA_EVENT_DESCRIBEFEATURES_RESULT
+ *
+ * @remark Features require broker version >= 2.4.0 (ApiVersions v3): an
+ *         older broker gives its API versions only, no features, and an
+ *         unknown finalized features epoch. Supported features with a
+ *         minimum version of 0, e.g. \c group.version, require broker
+ *         version >= 3.9.0 (ApiVersions v4).
+ */
+RD_EXPORT
+void rd_kafka_DescribeFeatures(rd_kafka_t *rk,
+                               const rd_kafka_AdminOptions_t *options,
+                               rd_kafka_queue_t *rkqu);
+
+/**
+ * @brief Gets the id of the broker that answered the request.
+ *
+ * @param result The result of DescribeFeatures.
+ *
+ * @return The broker id, or -1 if the request failed.
+ */
+RD_EXPORT
+int32_t rd_kafka_DescribeFeatures_result_node_id(
+    const rd_kafka_DescribeFeatures_result_t *result);
+
+/**
+ * @brief Gets the epoch of the finalized features.
+ *
+ * @param result The result of DescribeFeatures.
+ *
+ * @return The epoch, or -1 if unknown, or the request failed: then the
+ *         finalized features are not valid.
+ */
+RD_EXPORT
+int64_t rd_kafka_DescribeFeatures_result_finalized_features_epoch(
+    const rd_kafka_DescribeFeatures_result_t *result);
+
+/**
+ * @brief Gets the features finalized cluster-wide, with the range of their
+ *        version levels.
+ *
+ * @param result The result of DescribeFeatures.
+ * @param cntp is updated with the count of features.
+ *
+ * @return An array of features, in the broker's order.
+ * @remark The lifetime of the returned memory is the same
+ *         as the lifetime of the \p result object.
+ */
+RD_EXPORT
+const rd_kafka_FeatureVersionRange_t **
+rd_kafka_DescribeFeatures_result_finalized_features(
+    const rd_kafka_DescribeFeatures_result_t *result,
+    size_t *cntp);
+
+/**
+ * @brief Gets the features the broker answering supports, with the range of
+ *        their versions.
+ *
+ * @param result The result of DescribeFeatures.
+ * @param cntp is updated with the count of features.
+ *
+ * @return An array of features, in the broker's order.
+ * @remark The lifetime of the returned memory is the same
+ *         as the lifetime of the \p result object.
+ */
+RD_EXPORT
+const rd_kafka_FeatureVersionRange_t **
+rd_kafka_DescribeFeatures_result_supported_features(
+    const rd_kafka_DescribeFeatures_result_t *result,
+    size_t *cntp);
+
+/**
+ * @brief Gets the protocol APIs the broker answering supports, with the
+ *        range of their versions.
+ *
+ * @param result The result of DescribeFeatures.
+ * @param cntp is updated with the count of APIs.
+ *
+ * @return An array of APIs, sorted by API key.
+ * @remark The lifetime of the returned memory is the same
+ *         as the lifetime of the \p result object.
+ */
+RD_EXPORT
+const rd_kafka_ApiVersionRange_t **
+rd_kafka_DescribeFeatures_result_api_versions(
+    const rd_kafka_DescribeFeatures_result_t *result,
+    size_t *cntp);
+
+/**
+ * @brief Gets the name of the feature.
+ *
+ * @param range The feature version range.
+ *
+ * @return The feature name, e.g. "metadata.version".
+ * @remark The lifetime of the returned memory is the same
+ *         as the lifetime of the \p range object.
+ */
+RD_EXPORT
+const char *
+rd_kafka_FeatureVersionRange_name(const rd_kafka_FeatureVersionRange_t *range);
+
+/**
+ * @brief Gets the lowest version of the feature: of a finalized feature, its
+ *        minimum version level.
+ *
+ * @param range The feature version range.
+ *
+ * @return The minimum version, inclusive.
+ */
+RD_EXPORT
+int16_t rd_kafka_FeatureVersionRange_min_version(
+    const rd_kafka_FeatureVersionRange_t *range);
+
+/**
+ * @brief Gets the highest version of the feature: of a finalized feature,
+ *        its maximum version level, the one in effect.
+ *
+ * @param range The feature version range.
+ *
+ * @return The maximum version, inclusive.
+ */
+RD_EXPORT
+int16_t rd_kafka_FeatureVersionRange_max_version(
+    const rd_kafka_FeatureVersionRange_t *range);
+
+/**
+ * @brief Gets the key of the protocol API.
+ *
+ * @param range The API version range.
+ *
+ * @return The API key, e.g. 3 for Metadata.
+ */
+RD_EXPORT
+int16_t
+rd_kafka_ApiVersionRange_api_key(const rd_kafka_ApiVersionRange_t *range);
+
+/**
+ * @brief Gets the name of the protocol API.
+ *
+ * @param range The API version range.
+ *
+ * @return The API name, e.g. "Metadata", or "Unknown-<key>?" for an API
+ *         unknown to librdkafka.
+ * @remark The lifetime of the returned memory is the same
+ *         as the lifetime of the \p range object.
+ */
+RD_EXPORT
+const char *
+rd_kafka_ApiVersionRange_api_name(const rd_kafka_ApiVersionRange_t *range);
+
+/**
+ * @brief Gets the lowest version of the protocol API the broker supports.
+ *
+ * @param range The API version range.
+ *
+ * @return The minimum version, inclusive.
+ */
+RD_EXPORT
+int16_t
+rd_kafka_ApiVersionRange_min_version(const rd_kafka_ApiVersionRange_t *range);
+
+/**
+ * @brief Gets the highest version of the protocol API the broker supports.
+ *
+ * @param range The API version range.
+ *
+ * @return The maximum version, inclusive.
+ */
+RD_EXPORT
+int16_t
+rd_kafka_ApiVersionRange_max_version(const rd_kafka_ApiVersionRange_t *range);
 
 /**@}*/
 
